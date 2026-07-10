@@ -1,0 +1,5 @@
+POSTHOG_HOST=https://us.posthog.com
+POSTHOG_PROJECT_ID=replace-me
+POSTHOG_PERSONAL_API_KEY=replace-me
+CLOUDFLARE_ACCOUNT_ID=replace-me
+CLOUDFLARE_API_TOKEN=replace-me

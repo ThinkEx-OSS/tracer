@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "deploy": "vp build && wrangler deploy",
-    "types": "think types --all"
+    "types": "wrangler types --env-file .dev.vars.example --strict-vars=false --include-runtime=false env.d.ts && think types --all"
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.204",
