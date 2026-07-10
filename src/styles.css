@@ -1,5 +1,11 @@
 @import "@cloudflare/kumo/styles/standalone";
 
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
 html,
 body,
 #root {
@@ -40,17 +46,88 @@ body {
   overflow-y: auto;
 }
 
-.messages {
+.workspace-content {
   display: flex;
   min-height: 100%;
   flex-direction: column;
-  gap: 1rem;
+  gap: 2rem;
   padding: 2rem 1.25rem;
+}
+
+.check-card {
+  display: grid;
+  gap: 1rem;
+  border-width: 1px;
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+}
+
+.check-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.check-heading > div,
+.check-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+
+.check-summary {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.check-heading > div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.metric {
+  display: grid;
+  gap: 0.125rem;
+}
+
+.investigation {
+  display: flex;
+  min-height: 16rem;
+  flex: 1;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.section-heading > div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.messages {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1rem;
 }
 
 .empty-state {
   display: grid;
   flex: 1;
+  min-height: 10rem;
   place-items: center;
 }
 
@@ -94,8 +171,22 @@ body {
 }
 
 @media (max-width: 40rem) {
-  .messages {
+  .workspace-content {
     padding-block: 1.25rem;
+  }
+
+  .check-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .metrics {
+    grid-template-columns: 1fr;
   }
 
   .message {

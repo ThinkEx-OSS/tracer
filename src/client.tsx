@@ -9,6 +9,9 @@ import { useAgent } from "agents/react";
 import type { FormEvent } from "react";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createInitialWorkspaceState, type WorkspaceState } from "../shared/workspace";
+import { workspaceConfig } from "../workspace.config";
+import { CheckCard } from "./check-card";
 import "./styles.css";
 
 const sessionKey = "tracer-incident-thread";
@@ -30,14 +33,49 @@ function getText(message: UIMessage) {
   return text;
 }
 
+function workspaceStatus(status: WorkspaceState["status"]) {
+  if (status === "ready") return { label: "Monitoring", variant: "success" as const };
+  if (status === "checking") return { label: "Checking now", variant: "info" as const };
+  if (status === "partial") return { label: "Limited context", variant: "warning" as const };
+  if (status === "failed") return { label: "Check failed", variant: "error" as const };
+  return { label: "Connecting", variant: "neutral" as const };
+}
+
 function App() {
   const [input, setInput] = useState("");
-  const agent = useAgent({
+  const [workspace, setWorkspace] = useState<WorkspaceState>(() =>
+    createInitialWorkspaceState(workspaceConfig.check),
+  );
+  const [checkError, setCheckError] = useState<string>();
+  const workspaceAgent = useAgent<WorkspaceState>({
+    agent: "workspace-monitor",
+    name: workspaceConfig.id,
+    onStateUpdate: setWorkspace,
+  });
+  const incidentAgent = useAgent({
     agent: "incident-thread",
     name: getSessionId(),
   });
-  const { messages, sendMessage, status } = useAgentChat({ agent });
+  const { messages, sendMessage, status } = useAgentChat({ agent: incidentAgent });
   const isBusy = status === "submitted" || status === "streaming";
+  const monitorStatus = workspaceStatus(workspace.status);
+  const investigationLabel = isBusy
+    ? "Investigating"
+    : messages.length > 0
+      ? "Conversation open"
+      : "No open case";
+
+  async function runCheck() {
+    setCheckError(undefined);
+    try {
+      const nextState = await workspaceAgent.call<WorkspaceState>("reconcile", [], {
+        timeout: 60_000,
+      });
+      setWorkspace(nextState);
+    } catch {
+      setCheckError("The check could not run. Verify provider access and try again.");
+    }
+  }
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -49,39 +87,61 @@ function App() {
   }
 
   return (
-    <main className="app-shell bg-kumo-canvas text-kumo-default">
+    <div className="app-shell bg-kumo-canvas text-kumo-default">
       <header className="topbar border-kumo-hairline">
         <div className="content-width topbar-content">
           <Text variant="heading3" as="h1">
             Tracer
           </Text>
-          <Badge appearance="dot" variant={isBusy ? "info" : "success"}>
-            {isBusy ? "Thinking" : "Ready"}
+          <Badge appearance="dot" variant={monitorStatus.variant}>
+            {monitorStatus.label}
           </Badge>
         </div>
       </header>
 
-      <section aria-label="Incident Thread" className="transcript">
-        <div className="content-width messages" aria-live="polite">
-          {messages.length === 0 ? (
-            <div className="empty-state">
-              <Text variant="secondary">No active investigation.</Text>
-            </div>
-          ) : (
-            messages.map((message) => (
-              <article
-                className={`message ${message.role === "user" ? "message-user bg-kumo-tint" : "message-assistant"}`}
-                key={message.id}
-              >
-                <Text as="strong" bold size="xs">
-                  {message.role === "user" ? "You" : "Tracer"}
+      <main className="transcript">
+        <div className="content-width workspace-content">
+          <CheckCard error={checkError} onRun={() => void runCheck()} workspace={workspace} />
+
+          <section aria-labelledby="investigation-title" className="investigation">
+            <div className="section-heading">
+              <div>
+                <Text as="h2" id="investigation-title" variant="heading3">
+                  Investigation
                 </Text>
-                <Text>{getText(message)}</Text>
-              </article>
-            ))
-          )}
+                <Text variant="secondary">
+                  Tracer opens a case when a check finds a meaningful change.
+                </Text>
+              </div>
+              <Badge appearance="dot" variant={isBusy ? "info" : "neutral"}>
+                {investigationLabel}
+              </Badge>
+            </div>
+
+            <div className="messages" aria-live="polite">
+              {messages.length === 0 ? (
+                <div className="empty-state">
+                  <Text variant="secondary">
+                    Nothing needs investigation. Monitoring continues in the background.
+                  </Text>
+                </div>
+              ) : (
+                messages.map((message) => (
+                  <article
+                    className={`message ${message.role === "user" ? "message-user bg-kumo-tint" : "message-assistant"}`}
+                    key={message.id}
+                  >
+                    <Text as="strong" bold size="xs">
+                      {message.role === "user" ? "You" : "Tracer"}
+                    </Text>
+                    <Text>{getText(message)}</Text>
+                  </article>
+                ))
+              )}
+            </div>
+          </section>
         </div>
-      </section>
+      </main>
 
       <footer className="composer-shell border-kumo-hairline bg-kumo-base">
         <form className="content-width composer" onSubmit={submit}>
@@ -90,7 +150,7 @@ function App() {
             className="composer-input"
             value={input}
             onValueChange={setInput}
-            placeholder="Ask Tracer…"
+            placeholder="Ask about this workspace…"
             rows={1}
           />
           <Button
@@ -104,7 +164,7 @@ function App() {
           />
         </form>
       </footer>
-    </main>
+    </div>
   );
 }
 
