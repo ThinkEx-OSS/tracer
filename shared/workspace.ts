@@ -76,6 +76,7 @@ export interface OperationCheck {
 }
 
 export type CheckRunStatus = "healthy" | "insufficient_data" | "deviation" | "failed";
+export type DeviationKind = "latency" | "success_rate";
 
 interface CheckRunBase {
   id: string;
@@ -85,12 +86,15 @@ interface CheckRunBase {
   reason: string;
 }
 
-export interface CompletedCheckRun extends CheckRunBase {
-  status: Exclude<CheckRunStatus, "failed">;
+interface CheckRunEvidence {
   current: EvidenceWindow;
   baseline: EvidenceWindow;
   cached: boolean;
 }
+
+export type CompletedCheckRun = CheckRunBase &
+  CheckRunEvidence &
+  ({ status: "healthy" | "insufficient_data" } | { status: "deviation"; deviation: DeviationKind });
 
 export interface FailedCheckRun extends CheckRunBase {
   status: "failed";
@@ -113,6 +117,13 @@ export interface Change {
   summary: string;
 }
 
+export interface InvestigationSummary {
+  checkId: string;
+  checkRunId: string;
+  submittedAt: string;
+  threadId: string;
+}
+
 export interface WorkspaceState {
   status: "idle" | "checking" | "ready" | "partial" | "failed";
   checks: OperationCheck[];
@@ -121,6 +132,7 @@ export interface WorkspaceState {
   resource?: Resource;
   deployments: Deployment[];
   changes: Change[];
+  activeInvestigation?: InvestigationSummary;
   warning?: string;
 }
 

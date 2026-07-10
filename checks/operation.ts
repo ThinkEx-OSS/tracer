@@ -1,22 +1,27 @@
 import type {
   CheckRunStatus,
+  DeviationKind,
   OperationBucket,
   OperationCheck,
   OperationSummary,
 } from "../shared/workspace";
 
-export interface CheckEvaluation {
-  status: Exclude<CheckRunStatus, "failed">;
-  reason: string;
-}
-
-type Deviation = "latency" | "success_rate";
+export type CheckEvaluation =
+  | {
+      status: Exclude<CheckRunStatus, "deviation" | "failed">;
+      reason: string;
+    }
+  | {
+      status: "deviation";
+      reason: string;
+      deviation: DeviationKind;
+    };
 
 function deviation(
   check: OperationCheck,
   current: OperationSummary,
   baseline: OperationSummary,
-): Deviation | undefined {
+): DeviationKind | undefined {
   if (current.successRate !== null && baseline.successRate !== null) {
     const failureRate = 1 - current.successRate;
     const baselineFailureRate = 1 - baseline.successRate;
@@ -51,7 +56,7 @@ function longestPersistentDeviation(
   check: OperationCheck,
   buckets: OperationBucket[],
   baseline: OperationSummary,
-  kind: Deviation,
+  kind: DeviationKind,
 ) {
   let longest = 0;
   let current = 0;
@@ -112,12 +117,14 @@ export function evaluateOperationCheck(
   if (kind === "success_rate") {
     return {
       status: "deviation",
+      deviation: kind,
       reason: `Success rate was materially lower than the previous window for ${persistentBuckets} consecutive ${check.bucketMinutes}-minute periods.`,
     };
   }
 
   return {
     status: "deviation",
+    deviation: kind,
     reason: `P95 duration was materially higher than the previous window for ${persistentBuckets} consecutive ${check.bucketMinutes}-minute periods.`,
   };
 }

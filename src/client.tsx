@@ -14,17 +14,6 @@ import { workspaceConfig } from "../workspace.config";
 import { CheckCard } from "./check-card";
 import "./styles.css";
 
-const sessionKey = "tracer-incident-thread";
-
-function getSessionId() {
-  const existing = localStorage.getItem(sessionKey);
-  if (existing) return existing;
-
-  const created = crypto.randomUUID();
-  localStorage.setItem(sessionKey, created);
-  return created;
-}
-
 function getText(message: UIMessage) {
   let text = "";
   for (const part of message.parts) {
@@ -52,9 +41,10 @@ function App() {
     name: workspaceConfig.id,
     onStateUpdate: setWorkspace,
   });
+  const incidentThreadId = workspace.activeInvestigation?.threadId ?? workspaceConfig.id;
   const incidentAgent = useAgent({
     agent: "incident-thread",
-    name: getSessionId(),
+    name: incidentThreadId,
   });
   const { messages, sendMessage, status } = useAgentChat({ agent: incidentAgent });
   const isBusy = status === "submitted" || status === "streaming";
@@ -63,7 +53,9 @@ function App() {
     ? "Investigating"
     : messages.length > 0
       ? "Conversation open"
-      : "No open case";
+      : workspace.activeInvestigation
+        ? "Investigation queued"
+        : "No open case";
 
   async function runCheck() {
     setCheckError(undefined);
@@ -122,21 +114,31 @@ function App() {
               {messages.length === 0 ? (
                 <div className="empty-state">
                   <Text variant="secondary">
-                    Nothing needs investigation. Monitoring continues in the background.
+                    {workspace.activeInvestigation
+                      ? "A monitor finding is queued for triage."
+                      : "Nothing needs investigation. Monitoring continues in the background."}
                   </Text>
                 </div>
               ) : (
-                messages.map((message) => (
-                  <article
-                    className={`message ${message.role === "user" ? "message-user bg-kumo-tint" : "message-assistant"}`}
-                    key={message.id}
-                  >
-                    <Text as="strong" bold size="xs">
-                      {message.role === "user" ? "You" : "Tracer"}
-                    </Text>
-                    <Text>{getText(message)}</Text>
-                  </article>
-                ))
+                messages.map((message) => {
+                  const text = getText(message);
+                  const monitorBriefing = text.startsWith("[TRACER_MONITOR_BRIEFING]");
+                  return (
+                    <article
+                      className={`message ${message.role === "user" ? "message-user bg-kumo-tint" : "message-assistant"}`}
+                      key={message.id}
+                    >
+                      <Text as="strong" bold size="xs">
+                        {message.role === "user" ? (monitorBriefing ? "Monitor" : "You") : "Tracer"}
+                      </Text>
+                      <Text>
+                        {monitorBriefing
+                          ? "Production monitoring submitted a candidate deviation for triage."
+                          : text}
+                      </Text>
+                    </article>
+                  );
+                })
               )}
             </div>
           </section>
