@@ -1,0 +1,15 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "projects": ["tracer"],
+  "ignore": {
+    "files": [
+      "**/*.md",
+      "**/*.mdx",
+      "docs/**",
+      "references/**",
+      "dist/**",
+      "env.d.ts",
+      "think.d.ts"
+    ]
+  }
+}

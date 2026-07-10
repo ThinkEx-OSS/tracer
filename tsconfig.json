@@ -1,0 +1,4 @@
+{
+  "extends": "agents/tsconfig",
+  "include": ["agents", "src", "env.d.ts", "think.d.ts", "vite.config.ts"]
+}
