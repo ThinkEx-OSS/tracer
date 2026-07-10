@@ -44,7 +44,7 @@ function workspaceStatus(status: WorkspaceState["status"]) {
 function App() {
   const [input, setInput] = useState("");
   const [workspace, setWorkspace] = useState<WorkspaceState>(() =>
-    createInitialWorkspaceState(workspaceConfig.check),
+    createInitialWorkspaceState(workspaceConfig.checks),
   );
   const [checkError, setCheckError] = useState<string>();
   const workspaceAgent = useAgent<WorkspaceState>({

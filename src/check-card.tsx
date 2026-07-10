@@ -1,8 +1,7 @@
 import { Badge } from "@cloudflare/kumo/components/badge";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Text } from "@cloudflare/kumo/components/text";
-import type { CheckRunStatus, WorkspaceState } from "../shared/workspace";
-import { workspaceConfig } from "../workspace.config";
+import type { CheckRunStatus, OperationCheck, WorkspaceState } from "../shared/workspace";
 
 function runPresentation(status: CheckRunStatus) {
   if (status === "healthy") return { label: "Healthy", variant: "success" as const };
@@ -21,16 +20,14 @@ function duration(value: number | null) {
   return value === null ? "—" : `${Math.round(value).toLocaleString()}ms`;
 }
 
-export function CheckCard({
-  workspace,
-  error,
-  onRun,
-}: {
-  workspace: WorkspaceState;
-  error?: string;
-  onRun: () => void;
-}) {
-  const run = workspace.latestRun;
+function windowLabel(minutes: number) {
+  if (minutes % 1_440 === 0) return `${minutes / 1_440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function OperationCard({ check, workspace }: { check: OperationCheck; workspace: WorkspaceState }) {
+  const run = workspace.latestRuns.find((candidate) => candidate.checkId === check.id);
   const presentation = runPresentation(run?.status ?? "failed");
   const metrics =
     !run || run.status === "failed"
@@ -41,11 +38,16 @@ export function CheckCard({
             current: percent(run.current.summary.successRate),
             baseline: percent(run.baseline.summary.successRate),
           },
-          {
-            label: "P95 duration",
-            current: duration(run.current.summary.p95DurationMs),
-            baseline: duration(run.baseline.summary.p95DurationMs),
-          },
+          ...(run.current.summary.p95DurationMs !== null ||
+          run.baseline.summary.p95DurationMs !== null
+            ? [
+                {
+                  label: "P95 duration",
+                  current: duration(run.current.summary.p95DurationMs),
+                  baseline: duration(run.baseline.summary.p95DurationMs),
+                },
+              ]
+            : []),
           {
             label: "Completed operations",
             current: run.current.summary.attempts.toLocaleString(),
@@ -54,21 +56,12 @@ export function CheckCard({
         ];
 
   return (
-    <section aria-labelledby="check-title" className="check-card border-kumo-hairline bg-kumo-base">
+    <div className="operation-check border-kumo-hairline">
       <div className="check-heading">
-        <div>
-          <Text as="h2" id="check-title" variant="heading2">
-            {workspace.check.name}
-          </Text>
-          <Text variant="secondary">
-            Live user-impact telemetry from PostHog with Cloudflare deployment context.
-          </Text>
-        </div>
-        <Button loading={workspace.status === "checking"} onClick={onRun} variant="secondary">
-          Run check
-        </Button>
+        <Text as="h2" variant="heading2">
+          {check.name}
+        </Text>
       </div>
-
       {!run ? (
         <Text variant="secondary">No data checked yet.</Text>
       ) : (
@@ -79,7 +72,6 @@ export function CheckCard({
           <Text>{run.reason}</Text>
         </div>
       )}
-
       {metrics.length > 0 ? (
         <div className="metrics">
           {metrics.map((metric) => (
@@ -88,19 +80,50 @@ export function CheckCard({
               <Text as="strong" variant="heading2">
                 {metric.current}
               </Text>
-              <Text variant="secondary">Previous window {metric.baseline}</Text>
+              <Text variant="secondary">Baseline {metric.baseline}</Text>
             </div>
           ))}
         </div>
       ) : null}
-
       {run && run.status !== "failed" ? (
         <Text variant="secondary">
-          Updated {new Date(run.completedAt).toLocaleString()} · last{" "}
-          {workspaceConfig.check.currentWindowMinutes} min compared with the previous{" "}
-          {workspaceConfig.check.baselineWindowMinutes} min
+          Updated {new Date(run.completedAt).toLocaleString()} · current{" "}
+          {windowLabel(check.currentWindowMinutes)} · baseline{" "}
+          {windowLabel(check.baselineWindowMinutes)}
         </Text>
       ) : null}
+    </div>
+  );
+}
+
+export function CheckCard({
+  workspace,
+  error,
+  onRun,
+}: {
+  workspace: WorkspaceState;
+  error?: string;
+  onRun: () => void;
+}) {
+  return (
+    <section aria-labelledby="check-title" className="check-card border-kumo-hairline bg-kumo-base">
+      <div className="check-heading">
+        <div>
+          <Text as="h2" id="check-title" variant="heading2">
+            Production monitors
+          </Text>
+          <Text variant="secondary">
+            Live user-impact telemetry from PostHog with Cloudflare deployment context.
+          </Text>
+        </div>
+        <Button loading={workspace.status === "checking"} onClick={onRun} variant="secondary">
+          Run check
+        </Button>
+      </div>
+
+      {workspace.checks.map((check) => (
+        <OperationCard check={check} key={check.id} workspace={workspace} />
+      ))}
       {workspace.resource ? (
         <Text variant="secondary">
           Cloudflare · {workspace.resource.name} · {workspace.deployments.length} deployments synced

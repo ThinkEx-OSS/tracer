@@ -1,5 +1,9 @@
-import type { OperationCheckConfig } from "../checks/operation";
-import type { EvidenceWindow, OperationBucket, OperationSummary } from "../shared/workspace";
+import type {
+  EvidenceWindow,
+  OperationBucket,
+  OperationCheck,
+  OperationSummary,
+} from "../shared/workspace";
 import { fetchProviderJson, ProviderRequestError } from "./http";
 
 const MAX_BUCKETS = 500;
@@ -70,17 +74,35 @@ function parseBuckets(response: HogQlResponse, bucketMinutes: number): Operation
   });
 }
 
-function operationFilter(check: OperationCheckConfig, from: string, to: string) {
-  return `event = ${sqlString(check.event)} AND timestamp >= toDateTime(${sqlString(from)}) AND timestamp < toDateTime(${sqlString(to)})`;
+function eventFilter(check: OperationCheck) {
+  if (check.outcome.kind === "property") {
+    return `event = ${sqlString(check.outcome.event)}`;
+  }
+  return `event IN (${sqlString(check.outcome.success)}, ${sqlString(check.outcome.failure)})`;
 }
 
-function aggregation(check: OperationCheckConfig) {
-  const outcome = property(check.outcomeProperty);
-  const duration = property(check.durationProperty);
-  return `count(), countIf(${outcome} = 'success'), countIf(${outcome} = 'error'), quantile(0.5)(toFloat(${duration})), quantile(0.95)(toFloat(${duration}))`;
+function operationFilter(check: OperationCheck, from: string, to: string) {
+  return `${eventFilter(check)} AND timestamp >= toDateTime(${sqlString(from)}) AND timestamp < toDateTime(${sqlString(to)})`;
 }
 
-function bucketQuery(check: OperationCheckConfig, from: string, to: string) {
+function aggregation(check: OperationCheck) {
+  const outcomes =
+    check.outcome.kind === "property"
+      ? {
+          success: `${property(check.outcome.property)} = ${sqlString(check.outcome.success)}`,
+          failure: `${property(check.outcome.property)} = ${sqlString(check.outcome.failure)}`,
+        }
+      : {
+          success: `event = ${sqlString(check.outcome.success)}`,
+          failure: `event = ${sqlString(check.outcome.failure)}`,
+        };
+  const duration = check.durationProperty
+    ? `quantile(0.5)(toFloat(${property(check.durationProperty)})), quantile(0.95)(toFloat(${property(check.durationProperty)}))`
+    : "NULL, NULL";
+  return `count(), countIf(${outcomes.success}), countIf(${outcomes.failure}), ${duration}`;
+}
+
+function bucketQuery(check: OperationCheck, from: string, to: string) {
   if (!Number.isInteger(check.bucketMinutes) || check.bucketMinutes < 1) {
     throw new Error("PostHog bucket size must be a positive whole number of minutes");
   }
@@ -88,7 +110,7 @@ function bucketQuery(check: OperationCheckConfig, from: string, to: string) {
   return `SELECT toStartOfInterval(timestamp, INTERVAL ${check.bucketMinutes} MINUTE) AS bucket, ${aggregation(check)} FROM events WHERE ${operationFilter(check, from, to)} GROUP BY bucket ORDER BY bucket ASC LIMIT ${MAX_BUCKETS}`;
 }
 
-function summaryQuery(check: OperationCheckConfig, from: string, to: string) {
+function summaryQuery(check: OperationCheck, from: string, to: string) {
   return `SELECT ${aggregation(check)} FROM events WHERE ${operationFilter(check, from, to)}`;
 }
 
@@ -142,7 +164,7 @@ function window(
 
 export async function queryOperationEvidence(
   config: PostHogConfig,
-  check: OperationCheckConfig,
+  check: OperationCheck,
   now: Date,
 ): Promise<OperationEvidence> {
   const currentFrom = new Date(now.getTime() - check.currentWindowMinutes * 60 * 1_000);
@@ -151,7 +173,7 @@ export async function queryOperationEvidence(
   const baselineFromIso = baselineFrom.toISOString();
   const nowIso = now.toISOString();
   const [bucketResponse, currentResponse, baselineResponse] = await Promise.all([
-    runQuery(config, bucketQuery(check, baselineFromIso, nowIso), `Tracer buckets: ${check.id}`),
+    runQuery(config, bucketQuery(check, currentFromIso, nowIso), `Tracer buckets: ${check.id}`),
     runQuery(
       config,
       summaryQuery(check, currentFromIso, nowIso),
@@ -163,13 +185,15 @@ export async function queryOperationEvidence(
       `Tracer baseline window: ${check.id}`,
     ),
   ]);
-  const buckets = parseBuckets(bucketResponse, check.bucketMinutes);
-  const currentBuckets = buckets.filter((bucket) => bucket.from >= currentFrom.toISOString());
-  const baselineBuckets = buckets.filter((bucket) => bucket.from < currentFrom.toISOString());
 
   return {
-    current: window(currentFrom, now, parseSummary(currentResponse), currentBuckets),
-    baseline: window(baselineFrom, currentFrom, parseSummary(baselineResponse), baselineBuckets),
+    current: window(
+      currentFrom,
+      now,
+      parseSummary(currentResponse),
+      parseBuckets(bucketResponse, check.bucketMinutes),
+    ),
+    baseline: window(baselineFrom, currentFrom, parseSummary(baselineResponse), []),
     cached: Boolean(
       bucketResponse.is_cached || currentResponse.is_cached || baselineResponse.is_cached,
     ),

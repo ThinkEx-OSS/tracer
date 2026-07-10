@@ -62,6 +62,13 @@ body {
   padding: 1.25rem;
 }
 
+.operation-check {
+  display: grid;
+  gap: 0.75rem;
+  border-top-width: 1px;
+  padding-top: 1.25rem;
+}
+
 .check-heading {
   display: flex;
   align-items: center;

@@ -5,11 +5,6 @@ import type {
   OperationSummary,
 } from "../shared/workspace";
 
-export interface OperationCheckConfig extends OperationCheck {
-  outcomeProperty: string;
-  durationProperty: string;
-}
-
 export interface CheckEvaluation {
   status: Exclude<CheckRunStatus, "failed">;
   reason: string;
@@ -37,7 +32,11 @@ function deviation(
     }
   }
 
-  if (current.p95DurationMs !== null && baseline.p95DurationMs !== null) {
+  if (
+    check.thresholds.p95Duration &&
+    current.p95DurationMs !== null &&
+    baseline.p95DurationMs !== null
+  ) {
     if (
       current.p95DurationMs - baseline.p95DurationMs >=
         check.thresholds.p95Duration.absoluteIncreaseMs &&

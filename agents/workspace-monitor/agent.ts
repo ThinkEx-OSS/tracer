@@ -9,6 +9,7 @@ import {
   type CheckRun,
   type CheckRunSummary,
   type Deployment,
+  type OperationCheck,
   type WorkspaceState,
 } from "../../shared/workspace";
 import { workspaceConfig } from "../../workspace.config";
@@ -27,8 +28,8 @@ interface StoredChange {
   summary: string;
 }
 
-function checkTime() {
-  const bucketMs = workspaceConfig.check.bucketMinutes * 60 * 1_000;
+function checkTime(check: OperationCheck) {
+  const bucketMs = check.bucketMinutes * 60 * 1_000;
   return new Date(Math.floor(Date.now() / bucketMs) * bucketMs);
 }
 
@@ -58,11 +59,12 @@ function summarizeRun(run: CheckRun): CheckRunSummary {
 
 /** Owns reconciliation and durable operational history for one Workspace. */
 export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
-  initialState = createInitialWorkspaceState(workspaceConfig.check);
+  initialState = createInitialWorkspaceState(workspaceConfig.checks);
   private activeReconciliation?: Promise<WorkspaceState>;
 
   async onStart() {
     this.ensureSchema();
+    this.normalizeState();
     const schedules = await this.listSchedules({ type: "interval" });
     const reconciliationSchedules = schedules.filter(
       (schedule): schedule is Extract<Schedule<unknown>, { type: "interval" }> =>
@@ -81,6 +83,24 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
         retry: { maxAttempts: 2 },
       });
     }
+  }
+
+  private normalizeState() {
+    const previous = this.state as WorkspaceState & { latestRun?: CheckRun };
+    this.setState({
+      status: previous.status ?? "idle",
+      checks: workspaceConfig.checks,
+      latestRuns: Array.isArray(previous.latestRuns)
+        ? previous.latestRuns
+        : previous.latestRun
+          ? [previous.latestRun]
+          : [],
+      history: Array.isArray(previous.history) ? previous.history : [],
+      resource: previous.resource,
+      deployments: Array.isArray(previous.deployments) ? previous.deployments : [],
+      changes: Array.isArray(previous.changes) ? previous.changes : [],
+      warning: previous.warning,
+    });
   }
 
   private ensureSchema() {
@@ -184,79 +204,28 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
   }
 
   private async performReconciliation(): Promise<WorkspaceState> {
-    const now = checkTime();
-    const runId = `${workspaceConfig.check.id}:${now.toISOString()}`;
-    const existingRun = this.findRun(runId);
-    if (existingRun && existingRun.status !== "failed") {
-      const latestRun = parseCheckRun(existingRun.payload);
-      const recoveredState: WorkspaceState = {
-        ...this.state,
-        status: "ready",
-        check: workspaceConfig.check,
-        latestRun,
-        history: this.loadHistory(),
-        changes: this.loadChanges(),
-        warning: undefined,
-      };
-      this.setState(recoveredState);
-      return recoveredState;
-    }
-
     const startedAt = new Date().toISOString();
     this.setState({
       ...this.state,
       status: "checking",
-      check: workspaceConfig.check,
+      checks: workspaceConfig.checks,
       warning: undefined,
     });
 
-    const [operationResult, cloudflareResult] = await Promise.allSettled([
-      queryOperationEvidence(
-        {
-          host: this.env.POSTHOG_HOST,
-          projectId: this.env.POSTHOG_PROJECT_ID,
-          personalApiKey: this.env.POSTHOG_PERSONAL_API_KEY,
-        },
-        workspaceConfig.check,
-        now,
-      ),
+    const [latestRuns, cloudflareResult] = await Promise.all([
+      Promise.all(workspaceConfig.checks.map((check) => this.runCheck(check))),
       getCloudflareContext(
         {
           accountId: this.env.CLOUDFLARE_ACCOUNT_ID,
           apiToken: this.env.CLOUDFLARE_API_TOKEN,
         },
         workspaceConfig.workerName,
+      ).then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (reason: unknown) => ({ status: "rejected" as const, reason }),
       ),
     ]);
 
-    const completedAt = new Date().toISOString();
-    const latestRun: CheckRun =
-      operationResult.status === "fulfilled"
-        ? {
-            id: runId,
-            checkId: workspaceConfig.check.id,
-            ...evaluateOperationCheck(
-              workspaceConfig.check,
-              operationResult.value.current.summary,
-              operationResult.value.baseline.summary,
-              operationResult.value.current.buckets,
-            ),
-            startedAt,
-            completedAt,
-            current: operationResult.value.current,
-            baseline: operationResult.value.baseline,
-            cached: operationResult.value.cached,
-          }
-        : {
-            id: runId,
-            checkId: workspaceConfig.check.id,
-            status: "failed",
-            startedAt,
-            completedAt,
-            reason: providerErrorMessage(operationResult.reason, "PostHog check failed"),
-          };
-
-    this.persistRun(latestRun);
     if (cloudflareResult.status === "fulfilled") {
       this.recordDeploymentChanges(cloudflareResult.value.deployments);
     }
@@ -265,10 +234,16 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       cloudflareResult.status === "rejected"
         ? providerErrorMessage(cloudflareResult.reason, "Cloudflare context refresh failed")
         : undefined;
+    const failedChecks = latestRuns.filter((run) => run.status === "failed").length;
     const nextState: WorkspaceState = {
-      status: latestRun.status === "failed" ? "failed" : warning ? "partial" : "ready",
-      check: workspaceConfig.check,
-      latestRun,
+      status:
+        failedChecks === latestRuns.length
+          ? "failed"
+          : failedChecks > 0 || warning
+            ? "partial"
+            : "ready",
+      checks: workspaceConfig.checks,
+      latestRuns,
       history: this.loadHistory(),
       resource:
         cloudflareResult.status === "fulfilled"
@@ -286,16 +261,66 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     console.log(
       JSON.stringify({
         message: "workspace.reconciliation.completed",
-        checkId: latestRun.checkId,
-        runId: latestRun.id,
-        status: latestRun.status,
-        workspaceStatus: nextState.status,
-        durationMs: Date.parse(completedAt) - Date.parse(startedAt),
+        status: nextState.status,
+        durationMs: Date.now() - Date.parse(startedAt),
+        checkCount: latestRuns.length,
+        failedCheckCount: failedChecks,
+        findingCount: latestRuns.filter((run) => run.status === "deviation").length,
         historyCount: nextState.history.length,
         changeCount: nextState.changes.length,
       }),
     );
 
     return nextState;
+  }
+
+  private async runCheck(check: OperationCheck): Promise<CheckRun> {
+    const now = checkTime(check);
+    const runId = `${check.id}:${now.toISOString()}`;
+    const existingRun = this.findRun(runId);
+    if (existingRun && existingRun.status !== "failed") {
+      return parseCheckRun(existingRun.payload);
+    }
+
+    const startedAt = new Date().toISOString();
+    let run: CheckRun;
+    try {
+      const evidence = await queryOperationEvidence(
+        {
+          host: this.env.POSTHOG_HOST,
+          projectId: this.env.POSTHOG_PROJECT_ID,
+          personalApiKey: this.env.POSTHOG_PERSONAL_API_KEY,
+        },
+        check,
+        now,
+      );
+      run = {
+        id: runId,
+        checkId: check.id,
+        ...evaluateOperationCheck(
+          check,
+          evidence.current.summary,
+          evidence.baseline.summary,
+          evidence.current.buckets,
+        ),
+        startedAt,
+        completedAt: new Date().toISOString(),
+        current: evidence.current,
+        baseline: evidence.baseline,
+        cached: evidence.cached,
+      };
+    } catch (error) {
+      run = {
+        id: runId,
+        checkId: check.id,
+        status: "failed",
+        startedAt,
+        completedAt: new Date().toISOString(),
+        reason: providerErrorMessage(error, `PostHog check ${check.name} failed`),
+      };
+    }
+
+    this.persistRun(run);
+    return run;
   }
 }

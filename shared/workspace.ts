@@ -41,7 +41,20 @@ export interface EvidenceWindow {
 export interface OperationCheck {
   id: string;
   name: string;
-  event: string;
+  outcome:
+    | {
+        kind: "property";
+        event: string;
+        property: string;
+        success: string;
+        failure: string;
+      }
+    | {
+        kind: "events";
+        success: string;
+        failure: string;
+      };
+  durationProperty?: string;
   currentWindowMinutes: number;
   baselineWindowMinutes: number;
   bucketMinutes: number;
@@ -55,7 +68,7 @@ export interface OperationCheck {
       minimumFailureRate: number;
       failureMultiplier: number;
     };
-    p95Duration: {
+    p95Duration?: {
       absoluteIncreaseMs: number;
       multiplier: number;
     };
@@ -102,8 +115,8 @@ export interface Change {
 
 export interface WorkspaceState {
   status: "idle" | "checking" | "ready" | "partial" | "failed";
-  check: OperationCheck;
-  latestRun?: CheckRun;
+  checks: OperationCheck[];
+  latestRuns: CheckRun[];
   history: CheckRunSummary[];
   resource?: Resource;
   deployments: Deployment[];
@@ -111,9 +124,10 @@ export interface WorkspaceState {
   warning?: string;
 }
 
-export const createInitialWorkspaceState = (check: OperationCheck): WorkspaceState => ({
+export const createInitialWorkspaceState = (checks: OperationCheck[]): WorkspaceState => ({
   status: "idle",
-  check,
+  checks,
+  latestRuns: [],
   history: [],
   deployments: [],
   changes: [],
