@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tracer",
+  "main": "virtual:think/entry",
+  "compatibility_date": "2026-07-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": {
+    "binding": "AI",
+    "remote": true,
+  },
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/agents/*", "/messengers/*", "/__think/*"],
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ThinkAgent_WorkspaceMonitor",
+        "class_name": "ThinkAgent_WorkspaceMonitor",
+      },
+      {
+        "name": "ThinkAgent_IncidentThread",
+        "class_name": "ThinkAgent_IncidentThread",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ThinkAgent_WorkspaceMonitor", "ThinkAgent_IncidentThread"],
+    },
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "head_sampling_rate": 1,
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01,
+    },
+  },
+}
