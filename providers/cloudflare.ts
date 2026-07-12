@@ -12,6 +12,11 @@ interface CloudflareEnvelope<T> {
   result: T;
 }
 
+export interface CloudflareApiResult {
+  path: string;
+  data: unknown;
+}
+
 interface WorkerScript {
   id: string;
   tag: string;
@@ -39,11 +44,53 @@ function headers(config: CloudflareConfig) {
   return { Authorization: `Bearer ${config.apiToken}` };
 }
 
+function accountApiBase(config: CloudflareConfig) {
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(config.accountId)}`;
+}
+
+/** Read an account-scoped Cloudflare API endpoint without exposing the token to the model. */
+export async function queryCloudflareApi(
+  config: CloudflareConfig,
+  path: string,
+): Promise<CloudflareApiResult> {
+  if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
+    throw new Error("Cloudflare API path must be an account-relative path");
+  }
+
+  const accountBase = new URL(`${accountApiBase(config)}/`);
+  const url = new URL(path.slice(1), accountBase);
+  if (url.origin !== accountBase.origin || !url.pathname.startsWith(accountBase.pathname)) {
+    throw new Error("Cloudflare API path must remain within the configured account");
+  }
+  const data = await fetchProviderJson<unknown>("Cloudflare", url.toString(), {
+    headers: headers(config),
+  });
+  return { path: `${url.pathname}${url.search}`, data };
+}
+
+/** Query Cloudflare's read-only Analytics GraphQL API. */
+export async function queryCloudflareGraphql(
+  config: CloudflareConfig,
+  query: string,
+  variables: Record<string, unknown>,
+): Promise<unknown> {
+  if (query.length > 12_000) throw new Error("Cloudflare GraphQL query is too long");
+  if (!/^\s*(query\b|\{)/i.test(query) || /\bmutation\b/i.test(query)) {
+    throw new Error("Cloudflare investigations only support read-only GraphQL queries");
+  }
+
+  return fetchProviderJson<unknown>("Cloudflare", "https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: { ...headers(config), "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+}
+
 export async function getCloudflareContext(
   config: CloudflareConfig,
   workerName: string,
 ): Promise<CloudflareContext> {
-  const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(config.accountId)}`;
+  const base = accountApiBase(config);
   const scripts = await fetchProviderJson<CloudflareEnvelope<WorkerScript[]>>(
     "Cloudflare",
     `${base}/workers/scripts`,

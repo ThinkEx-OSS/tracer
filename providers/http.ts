@@ -1,4 +1,5 @@
 const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_RESPONSE_BYTES = 1_000_000;
 
 export class ProviderRequestError extends Error {
   readonly provider: string;
@@ -37,9 +38,19 @@ export async function fetchProviderJson<T>(
     );
   }
 
+  const declaredSize = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredSize) && declaredSize > MAX_RESPONSE_BYTES) {
+    throw new ProviderRequestError(provider, `${provider} response was too large`);
+  }
+
   try {
-    return (await response.json()) as T;
-  } catch {
+    const body = await response.text();
+    if (body.length > MAX_RESPONSE_BYTES) {
+      throw new ProviderRequestError(provider, `${provider} response was too large`);
+    }
+    return JSON.parse(body) as T;
+  } catch (error) {
+    if (error instanceof ProviderRequestError) throw error;
     throw new ProviderRequestError(provider, `${provider} returned an invalid JSON response`);
   }
 }

@@ -84,14 +84,14 @@ export function evaluateOperationCheck(
   if (current.attempts < check.minimumCurrentAttempts) {
     return {
       status: "insufficient_data",
-      reason: `The last ${check.currentWindowMinutes} minutes include ${current.attempts} completed operations; ${check.minimumCurrentAttempts} are required.`,
+      reason: `Waiting for activity (${current.attempts} of ${check.minimumCurrentAttempts} completed).`,
     };
   }
 
   if (baseline.attempts < check.minimumBaselineAttempts) {
     return {
       status: "insufficient_data",
-      reason: `The previous ${check.baselineWindowMinutes} minutes include ${baseline.attempts} completed operations; ${check.minimumBaselineAttempts} are required.`,
+      reason: `Building a baseline (${baseline.attempts} of ${check.minimumBaselineAttempts} completed).`,
     };
   }
 

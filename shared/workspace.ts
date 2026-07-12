@@ -46,14 +46,15 @@ export interface OperationCheck {
         kind: "property";
         event: string;
         property: string;
-        success: string;
-        failure: string;
+        success: string[];
+        failure: string[];
       }
     | {
         kind: "events";
-        success: string;
-        failure: string;
+        success: string[];
+        failure: string[];
       };
+  filters?: Record<string, string | string[]>;
   durationProperty?: string;
   currentWindowMinutes: number;
   baselineWindowMinutes: number;
@@ -117,11 +118,26 @@ export interface Change {
   summary: string;
 }
 
+export type InvestigationKind = "monitor" | "simulation";
+
+/** Durable lifecycle of an investigation dispatched by the workspace monitor. */
+export type InvestigationStatus = "investigating" | "reported" | "failed";
+export type InvestigationVerdict = "incident" | "no_incident" | "inconclusive";
+export type InvestigationConfidence = "low" | "medium" | "high";
+
+/** Check-run ids for simulated investigations are prefixed so their origin is unambiguous. */
+export const SIMULATION_RUN_PREFIX = "simulation:";
+
 export interface InvestigationSummary {
+  kind: InvestigationKind;
+  status: InvestigationStatus;
   checkId: string;
   checkRunId: string;
   submittedAt: string;
   threadId: string;
+  verdict?: InvestigationVerdict;
+  confidence?: InvestigationConfidence;
+  error?: string;
 }
 
 export interface WorkspaceState {
@@ -132,7 +148,7 @@ export interface WorkspaceState {
   resource?: Resource;
   deployments: Deployment[];
   changes: Change[];
-  activeInvestigation?: InvestigationSummary;
+  investigations: InvestigationSummary[];
   warning?: string;
 }
 
@@ -143,4 +159,5 @@ export const createInitialWorkspaceState = (checks: OperationCheck[]): Workspace
   history: [],
   deployments: [],
   changes: [],
+  investigations: [],
 });
