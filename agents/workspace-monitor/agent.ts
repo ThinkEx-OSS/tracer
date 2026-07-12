@@ -1,5 +1,6 @@
 import { Agent, callable, getAgentByName, type Schedule } from "agents";
 import { evaluateOperationCheck } from "../../checks/operation";
+import { configuredRepositoryPath } from "../../investigation/sandbox";
 import { getCloudflareContext } from "../../providers/cloudflare";
 import { providerErrorMessage } from "../../providers/http";
 import { queryOperationEvidence } from "../../providers/posthog";
@@ -9,8 +10,12 @@ import {
   type CheckRun,
   type CheckRunSummary,
   type Deployment,
+  type InvestigationConfidence,
+  type InvestigationStatus,
   type InvestigationSummary,
+  type InvestigationVerdict,
   type OperationCheck,
+  SIMULATION_RUN_PREFIX,
   type WorkspaceState,
 } from "../../shared/workspace";
 import { workspaceConfig } from "../../workspace.config";
@@ -35,11 +40,19 @@ interface StoredInvestigationSubmission {
   check_run_id: string;
   submitted_at: string;
   thread_id: string;
+  status: InvestigationStatus | null;
+  verdict: InvestigationVerdict | null;
+  confidence: InvestigationConfidence | null;
+  error_message: string | null;
 }
 
 function checkTime(check: OperationCheck) {
   const bucketMs = check.bucketMinutes * 60 * 1_000;
   return new Date(Math.floor(Date.now() / bucketMs) * bucketMs);
+}
+
+function investigationThreadId() {
+  return `${workspaceConfig.id}--investigation--${crypto.randomUUID()}`;
 }
 
 function parseCheckRun(payload: string): CheckRun {
@@ -95,7 +108,10 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
   }
 
   private normalizeState() {
-    const previous = this.state as WorkspaceState & { latestRun?: CheckRun };
+    const previous = this.state as WorkspaceState & {
+      latestRun?: CheckRun;
+      activeInvestigation?: InvestigationSummary;
+    };
     this.setState({
       status: previous.status ?? "idle",
       checks: workspaceConfig.checks,
@@ -108,7 +124,11 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       resource: previous.resource,
       deployments: Array.isArray(previous.deployments) ? previous.deployments : [],
       changes: Array.isArray(previous.changes) ? previous.changes : [],
-      activeInvestigation: previous.activeInvestigation,
+      investigations: Array.isArray(previous.investigations)
+        ? previous.investigations
+        : previous.activeInvestigation
+          ? [previous.activeInvestigation]
+          : [],
       warning: previous.warning,
     });
   }
@@ -140,9 +160,34 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
         check_run_id TEXT PRIMARY KEY,
         check_id TEXT NOT NULL,
         thread_id TEXT NOT NULL,
-        submitted_at TEXT NOT NULL
+        submitted_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'investigating',
+        verdict TEXT,
+        confidence TEXT,
+        error_message TEXT,
+        updated_at TEXT
       )
     `;
+    // Backfill status columns for databases created before status tracking.
+    const columns = this.sql<{
+      name: string;
+    }>`PRAGMA table_info(investigation_submissions)`.map((row) => row.name);
+    if (!columns.includes("status")) {
+      void this
+        .sql`ALTER TABLE investigation_submissions ADD COLUMN status TEXT NOT NULL DEFAULT 'investigating'`;
+    }
+    if (!columns.includes("verdict")) {
+      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN verdict TEXT`;
+    }
+    if (!columns.includes("confidence")) {
+      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN confidence TEXT`;
+    }
+    if (!columns.includes("updated_at")) {
+      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN updated_at TEXT`;
+    }
+    if (!columns.includes("error_message")) {
+      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN error_message TEXT`;
+    }
     void this
       .sql`CREATE INDEX IF NOT EXISTS investigation_submissions_submitted ON investigation_submissions(submitted_at DESC)`;
     void this
@@ -215,20 +260,61 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     }));
   }
 
-  private loadActiveInvestigation(): InvestigationSummary | undefined {
-    const row = this.sql<StoredInvestigationSubmission>`
-      SELECT check_run_id, check_id, thread_id, submitted_at
+  private loadInvestigations(): InvestigationSummary[] {
+    const rows = this.sql<StoredInvestigationSubmission>`
+      SELECT check_run_id, check_id, thread_id, submitted_at, status, verdict, confidence, error_message
       FROM investigation_submissions
       ORDER BY submitted_at DESC
-      LIMIT 1
-    `[0];
-    if (!row) return undefined;
-    return {
+      LIMIT ${STATE_HISTORY_LIMIT}
+    `;
+    return rows.map((row) => ({
+      kind: row.check_run_id.startsWith(SIMULATION_RUN_PREFIX) ? "simulation" : "monitor",
+      status: row.status ?? "investigating",
       checkId: row.check_id,
       checkRunId: row.check_run_id,
       submittedAt: row.submitted_at,
       threadId: row.thread_id,
-    };
+      verdict: row.verdict ?? undefined,
+      confidence: row.confidence ?? undefined,
+      error: row.error_message ?? undefined,
+    }));
+  }
+
+  private updateInvestigationStatus(input: {
+    threadId: string;
+    status: InvestigationStatus;
+    verdict?: InvestigationVerdict;
+    confidence?: InvestigationConfidence;
+    error?: string;
+  }) {
+    const updated = this.sql<{ thread_id: string }>`
+      UPDATE investigation_submissions
+      SET status = ${input.status},
+          verdict = ${input.verdict ?? null},
+          confidence = ${input.confidence ?? null},
+          error_message = ${input.error ?? null},
+          updated_at = ${new Date().toISOString()}
+      WHERE thread_id = ${input.threadId}
+      RETURNING thread_id
+    `;
+    if (updated.length === 0) {
+      throw new Error(`Investigation ${input.threadId} was not found`);
+    }
+    this.setState({ ...this.state, investigations: this.loadInvestigations() });
+  }
+
+  /**
+   * Called back by an Incident Thread when it submits its report, so a
+   * collapsed investigation row can show its verdict without opening a live
+   * connection to the thread.
+   */
+  async recordInvestigationStatus(input: {
+    threadId: string;
+    status: InvestigationStatus;
+    verdict?: InvestigationVerdict;
+    confidence?: InvestigationConfidence;
+  }): Promise<void> {
+    this.updateInvestigationStatus(input);
   }
 
   @callable()
@@ -241,6 +327,25 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     } finally {
       this.activeReconciliation = undefined;
     }
+  }
+
+  /**
+   * Starts a synthetic investigation to exercise the full pipeline end to end
+   * (clone repo, investigate, write a report, open a draft PR) without waiting
+   * for a real deviation. For testing the investigation path only.
+   */
+  @callable()
+  async simulateInvestigation(): Promise<WorkspaceState> {
+    const runId = `${SIMULATION_RUN_PREFIX}${new Date().toISOString()}`;
+    const checkId = workspaceConfig.checks[0]?.id ?? "simulation";
+
+    this.dispatchInvestigation({
+      checkId,
+      checkRunId: runId,
+      prompt: buildSimulationBriefing(),
+      threadId: investigationThreadId(),
+    });
+    return this.state;
   }
 
   private async performReconciliation(): Promise<WorkspaceState> {
@@ -276,21 +381,16 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
         : undefined;
     const failedChecks = latestRuns.filter((run) => run.status === "failed").length;
     const changes = this.loadChanges();
-    const investigationResults = await Promise.allSettled(
-      latestRuns.map((run) => this.submitInvestigation(run, changes)),
-    );
-    const investigationFailure = investigationResults.find(
-      (result): result is PromiseRejectedResult => result.status === "rejected",
-    );
-    const investigationWarning = investigationFailure
-      ? providerErrorMessage(investigationFailure.reason, "Investigation handoff failed")
-      : undefined;
+    let investigationWarning: string | undefined;
+    for (const run of latestRuns) {
+      try {
+        this.submitInvestigation(run, changes);
+      } catch (error) {
+        investigationWarning = providerErrorMessage(error, "Investigation handoff failed");
+      }
+    }
     const warning =
       [cloudflareWarning, investigationWarning].filter(Boolean).join(" ") || undefined;
-    let activeInvestigation = this.loadActiveInvestigation();
-    for (const result of investigationResults) {
-      if (result.status === "fulfilled" && result.value) activeInvestigation = result.value;
-    }
     const nextState: WorkspaceState = {
       status:
         failedChecks === latestRuns.length
@@ -310,7 +410,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
           ? cloudflareResult.value.deployments
           : this.state.deployments,
       changes,
-      activeInvestigation,
+      investigations: this.loadInvestigations(),
       warning,
     };
 
@@ -381,48 +481,80 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     return run;
   }
 
-  private async submitInvestigation(
-    run: CheckRun,
-    changes: Change[],
-  ): Promise<InvestigationSummary | undefined> {
+  private submitInvestigation(run: CheckRun, changes: Change[]): void {
     if (
       run.status !== "deviation" ||
       !("deviation" in run) ||
       !["latency", "success_rate"].includes(run.deviation)
     ) {
-      return undefined;
+      return;
     }
 
     const existing = this.sql`
       SELECT check_run_id FROM investigation_submissions WHERE check_run_id = ${run.id} LIMIT 1
     `[0];
-    if (existing) return undefined;
+    if (existing) return;
 
     const check = workspaceConfig.checks.find((candidate) => candidate.id === run.checkId);
     if (!check) throw new Error(`Missing check configuration for ${run.checkId}`);
 
-    const threadId = `${workspaceConfig.id}--${run.checkId}--${run.deviation}`;
     const cooldownStartedAt = new Date(Date.now() - INVESTIGATION_COOLDOWN_MS).toISOString();
     const recentThreadSubmission = this.sql`
       SELECT check_run_id
       FROM investigation_submissions
-      WHERE thread_id = ${threadId} AND submitted_at >= ${cooldownStartedAt}
+      WHERE check_id = ${run.checkId}
+        AND status != 'failed'
+        AND submitted_at >= ${cooldownStartedAt}
       LIMIT 1
     `[0];
-    if (recentThreadSubmission) return undefined;
+    if (recentThreadSubmission) return;
 
-    const submittedAt = new Date().toISOString();
-    const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, threadId);
-    await incident.submitMonitorBriefing({
-      idempotencyKey: run.id,
+    this.dispatchInvestigation({
+      checkId: run.checkId,
+      checkRunId: run.id,
       prompt: buildInvestigationBriefing(check.name, run, changes),
+      threadId: investigationThreadId(),
     });
+  }
 
+  private dispatchInvestigation(input: {
+    checkId: string;
+    checkRunId: string;
+    prompt: string;
+    threadId: string;
+  }): void {
+    const submittedAt = new Date().toISOString();
     void this.sql`
-      INSERT OR IGNORE INTO investigation_submissions (check_run_id, check_id, thread_id, submitted_at)
-      VALUES (${run.id}, ${run.checkId}, ${threadId}, ${submittedAt})
+      INSERT INTO investigation_submissions (check_run_id, check_id, thread_id, submitted_at)
+      VALUES (${input.checkRunId}, ${input.checkId}, ${input.threadId}, ${submittedAt})
     `;
-    return { checkId: run.checkId, checkRunId: run.id, submittedAt, threadId };
+    this.setState({ ...this.state, investigations: this.loadInvestigations() });
+    this.ctx.waitUntil(this.runInvestigation(input));
+  }
+
+  private async runInvestigation(input: { checkRunId: string; prompt: string; threadId: string }) {
+    try {
+      const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, input.threadId);
+      await incident.submitMonitorBriefing({
+        idempotencyKey: input.checkRunId,
+        prompt: input.prompt,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Investigation failed";
+      this.updateInvestigationStatus({
+        threadId: input.threadId,
+        status: "failed",
+        error: message,
+      });
+      console.log(
+        JSON.stringify({
+          message: "investigation.run.failed",
+          threadId: input.threadId,
+          checkRunId: input.checkRunId,
+          error: message,
+        }),
+      );
+    }
   }
 }
 
@@ -431,9 +563,7 @@ function buildInvestigationBriefing(checkName: string, run: CheckRun, changes: C
 
   return [
     "[TRACER_MONITOR_BRIEFING]",
-    `A deterministic production monitor detected a candidate deviation in ${checkName}.`,
-    "Perform conservative triage before treating this as an incident. The default verdict is no anomaly when the evidence is weak or explained by sparse traffic or workload mix.",
-    "Separate observations, inferences, and unknowns. Do not claim causation from deployment proximity alone.",
+    `Investigate this candidate deviation in ${checkName}.`,
     "",
     "Check Run:",
     JSON.stringify(run, null, 2),
@@ -441,6 +571,30 @@ function buildInvestigationBriefing(checkName: string, run: CheckRun, changes: C
     "Recent Cloudflare changes:",
     JSON.stringify(changes.slice(0, 10), null, 2),
     "",
-    "Return a concise triage report with Verdict (no anomaly, needs evidence, or investigate), Reason, Evidence, and Unknowns.",
+    "Relevant source repositories:",
+    JSON.stringify(workspaceConfig.repositories, null, 2),
+    "",
+    "Follow your operating instructions and return an evidence-backed report.",
+  ].join("\n");
+}
+
+function buildSimulationBriefing() {
+  return [
+    "[TRACER_SIMULATION_BRIEFING]",
+    "This is a Tracer end-to-end self-test (a drill), not a real production incident.",
+    "The goal is to exercise the full investigation pipeline: inspect the repository, produce a report, and open a draft pull request. Do not fabricate telemetry findings or claim a real incident.",
+    "",
+    `The configured repository is already cloned in your container at ${configuredRepositoryPath()}.`,
+    "",
+    "Do the following:",
+    "1. Inspect the repository's structure, dependencies, and recent history.",
+    "2. Write a concise report on the repository: what it does, its main components, and one small, safe, genuinely correct improvement you can make (for example a documentation fix, a comment, or an obvious typo). Do not make risky or behavioral changes.",
+    "3. Apply that small improvement and run any quick build or checks available to confirm it does not break anything.",
+    "4. Use publish_autofix to open a DRAFT pull request. In the PR title and body, clearly state that this is a Tracer end-to-end test drill and not a response to a real incident.",
+    "",
+    "Relevant source repositories:",
+    JSON.stringify(workspaceConfig.repositories, null, 2),
+    "",
+    "Finish with a short report describing each step you completed and the resulting draft pull request.",
   ].join("\n");
 }

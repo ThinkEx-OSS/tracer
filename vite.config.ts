@@ -30,7 +30,12 @@ function removeLocalSecretsFromBuild(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [think(), react(), cloudflare(), removeLocalSecretsFromBuild()],
+  plugins: [
+    think({ allowNonVirtualMain: true }),
+    react(),
+    cloudflare(),
+    removeLocalSecretsFromBuild(),
+  ],
   optimizeDeps: {
     entries: ["index.html"],
   },
