@@ -49,7 +49,7 @@ function OperationCard({ check, workspace }: { check: OperationCheck; workspace:
               ]
             : []),
           {
-            label: "Completed operations",
+            label: "Completed",
             current: run.current.summary.attempts.toLocaleString(),
             baseline: run.baseline.summary.attempts.toLocaleString(),
           },
@@ -87,9 +87,8 @@ function OperationCard({ check, workspace }: { check: OperationCheck; workspace:
       ) : null}
       {run && run.status !== "failed" ? (
         <Text variant="secondary">
-          Updated {new Date(run.completedAt).toLocaleString()} · current{" "}
-          {windowLabel(check.currentWindowMinutes)} · baseline{" "}
-          {windowLabel(check.baselineWindowMinutes)}
+          Updated {new Date(run.completedAt).toLocaleString()} ·{" "}
+          {windowLabel(check.currentWindowMinutes)} vs {windowLabel(check.baselineWindowMinutes)}
         </Text>
       ) : null}
     </div>
@@ -106,24 +105,24 @@ export function CheckCard({
   onRun: () => void;
 }) {
   return (
-    <section aria-labelledby="check-title" className="check-card border-kumo-hairline bg-kumo-base">
-      <div className="check-heading">
-        <div>
-          <Text as="h2" id="check-title" variant="heading2">
-            Production monitors
+    <section aria-label="Production monitors" className="check-card">
+      <div className="section-head monitor-head">
+        <div className="section-heading">
+          <Text as="h2" variant="heading3">
+            Monitors
           </Text>
-          <Text variant="secondary">
-            Live user-impact telemetry from PostHog with Cloudflare deployment context.
-          </Text>
+          <Text variant="secondary">Production telemetry checks</Text>
         </div>
         <Button loading={workspace.status === "checking"} onClick={onRun} variant="secondary">
-          Run check
+          Run checks
         </Button>
       </div>
 
-      {workspace.checks.map((check) => (
-        <OperationCard check={check} key={check.id} workspace={workspace} />
-      ))}
+      <div className="monitor-grid">
+        {workspace.checks.map((check) => (
+          <OperationCard check={check} key={check.id} workspace={workspace} />
+        ))}
+      </div>
       {workspace.resource ? (
         <Text variant="secondary">
           Cloudflare · {workspace.resource.name} · {workspace.deployments.length} deployments synced
