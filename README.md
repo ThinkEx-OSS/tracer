@@ -1,53 +1,47 @@
+<p align="center">
+  <img src="public/tracer-mark.svg" alt="Tracer logo" width="96" />
+</p>
+
 # Tracer
 
-Tracer is ThinkEx's production monitoring and automated investigation service. It evaluates product and infrastructure signals, opens durable incident threads, gathers bounded evidence from PostHog, Cloudflare, GitHub, and the public web, and can publish narrowly scoped fixes as draft pull requests.
+## How it works
 
-The current workspace configuration targets ThinkEx production. Forks and self-hosted deployments should replace the repository, Worker, telemetry, and monitor definitions in `workspace.config.ts` before deployment.
+- Monitors product health signals including user frustration, frontend reliability, web performance, file processing, AI turns, and tool usage.
+- Opens a durable investigation when it detects a real failure or meaningful change from the baseline.
+- Gives the investigator an isolated Linux sandbox with the ThinkEx repository, a full development toolchain, and bounded access to PostHog, Cloudflare, GitHub, and the web.
+- Produces an evidence-backed incident report and can open a tested, narrowly scoped draft pull request when the cause is in the code.
 
-## Architecture
+## Cloudflare and agent stack
 
-- `agents/workspace-monitor` schedules telemetry checks and owns durable monitor history.
-- `agents/incident-thread` runs evidence-backed investigations with durable transcripts.
-- `investigation/` contains the sandbox, research tools, persistence, and guarded autofix publisher.
-- `providers/` contains bounded provider integrations.
-- `src/` contains the monitoring dashboard.
+| Technology | Why Tracer uses it |
+| --- | --- |
+| [Cloudflare Workers](https://developers.cloudflare.com/workers/) | Runs the app and keeps models, telemetry, secrets, and privileged actions behind one trusted boundary. |
+| [Cloudflare Agents SDK](https://developers.cloudflare.com/agents/) | Adds stateful agents, scheduled checks, RPC, and live client synchronization. |
+| [Cloudflare Think](https://github.com/cloudflare/agents/tree/main/packages/think) | Provides the durable investigation loop: tools, memory, queued work, streaming, and recovery. |
+| [Durable Objects](https://developers.cloudflare.com/durable-objects/) + SQLite | Persist each monitor and incident thread, including history, transcripts, and reports. |
+| [Workers AI](https://developers.cloudflare.com/workers-ai/) | Runs the investigation model (`@cf/moonshotai/kimi-k2.6`) close to the Worker runtime. |
+| [Sandbox SDK](https://developers.cloudflare.com/sandbox/) + [Cloudflare Containers](https://developers.cloudflare.com/containers/) | Gives every investigation an isolated Linux machine where it can inspect, edit, build, and test the real repository. |
+| [Cloudflare Observability](https://developers.cloudflare.com/workers/observability/) | Records Tracer's own logs and traces for production debugging. |
 
-Investigations run inside a Cloudflare Container. Production state is stored in Durable Objects, while privileged provider credentials remain Worker secrets and are never placed in the investigation container.
+The investigation container never receives PostHog, Cloudflare, or GitHub credentials. Those remain Worker secrets and are only used by narrow server-side tools and actions.
 
-## Development
+## Tools and integrations
 
-Requirements:
+| Integration | Why Tracer uses it |
+| --- | --- |
+| PostHog API | Supplies live product evidence through bounded, read-only HogQL queries. |
+| Cloudflare REST + GraphQL APIs | Correlate runtime errors and traffic with versions and deployments. |
+| Firecrawl | Adds current public documentation and external context to investigations. |
+| ThinkEx repository | Lets the agent verify telemetry findings against the code and run real checks. |
+| GitHub API | Publishes a tested fix as a guarded draft PR without granting merge or deploy access. |
 
-- Node.js 24
-- pnpm 11
-- a Cloudflare account with Workers, Containers, Durable Objects, and Workers AI access
+## Application stack
 
-Install dependencies and create local secrets:
-
-```bash
-pnpm install
-cp .dev.vars.example .dev.vars
-```
-
-Fill in `.dev.vars`, then run the standard checks:
-
-```bash
-pnpm exec vp check
-pnpm exec vp build
-```
-
-`.dev.vars` and other local environment files are ignored by Git. Never commit provider tokens or production identifiers that are not intended to be public.
-
-## Deployment
-
-Review `workspace.config.ts` and `wrangler.jsonc`, provision every required Worker secret, and deploy with:
-
-```bash
-pnpm run deploy
-```
-
-The dashboard currently has no application-level authentication. Put it behind an appropriate access-control layer before exposing a deployment that should not be publicly reachable.
-
-## Security
-
-Please follow [SECURITY.md](SECURITY.md) when reporting a vulnerability. Do not include credentials, private telemetry, or customer data in a public issue.
+| Technology | Why Tracer uses it |
+| --- | --- |
+| React, Base UI, Tailwind CSS, and Lucide | Build the monitoring and live-investigation interface. |
+| Vite + Cloudflare Vite plugin | Build the frontend and Worker as one application. |
+| AI SDK | Standardize model messages, streaming, and tool execution. |
+| Zod | Validate every tool, action, and provider input at runtime. |
+| TypeScript, Node.js, and pnpm | Provide one typed toolchain across the app and investigation container. |
+| Vite+ | Run repository checks and production builds. |
