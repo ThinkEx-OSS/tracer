@@ -3,6 +3,8 @@ import { z } from "zod";
 import { queryCloudflareApi, queryCloudflareGraphql } from "../providers/cloudflare";
 import { queryPostHog } from "../providers/posthog";
 import { configuredRepositoryPath, getInvestigationSandbox } from "./sandbox";
+import { createRepositoryGrepTool } from "./repository-grep";
+import { createInvestigationWebTools } from "./web-tools";
 
 const SHELL_TIMEOUT_DEFAULT_MS = 120_000;
 const SHELL_TIMEOUT_MAX_MS = 600_000;
@@ -24,6 +26,11 @@ export function createInvestigationTools(env: Cloudflare.Env, threadId: string):
   const repositoryPath = configuredRepositoryPath();
 
   return {
+    ...createInvestigationWebTools(env),
+    // Overrides Think's generic workspace grep. The repository is already in a
+    // real container, so native ripgrep is both faster and more explicit about
+    // whether ignored dependency/generated trees should be searched.
+    grep: createRepositoryGrepTool({ executor: sandbox, repositoryPath }),
     posthog_query: tool({
       description:
         "Run one read-only HogQL query against the configured PostHog project. Use it to inspect events, properties, cohorts, sessions, errors, and user-impact patterns. Return only the fields needed as evidence and add a LIMIT.",

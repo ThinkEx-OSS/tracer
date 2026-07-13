@@ -8,6 +8,9 @@
     "binding": "AI",
     "remote": true,
   },
+  "vars": {
+    "FIRECRAWL_API_URL": "https://api.firecrawl.dev",
+  },
   "worker_loaders": [{ "binding": "LOADER" }],
   "secrets": {
     "required": [
@@ -17,6 +20,7 @@
       "CLOUDFLARE_ACCOUNT_ID",
       "CLOUDFLARE_API_TOKEN",
       "GITHUB_TOKEN",
+      "FIRECRAWL_API_KEY",
     ],
   },
   "containers": [

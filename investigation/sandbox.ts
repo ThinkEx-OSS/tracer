@@ -18,10 +18,13 @@ const DEPENDENCY_INPUTS = [
 ];
 
 function sandboxId(threadId: string) {
-  return `investigation-${threadId}`
+  const suffix = threadId
     .toLowerCase()
     .replaceAll(/[^a-z0-9-]/g, "-")
-    .slice(0, 63);
+    .replaceAll(/^-+|-+$/g, "")
+    .slice(-49);
+  if (!suffix) throw new Error("Investigation thread ID has no DNS-safe characters");
+  return `investigation-${suffix}`;
 }
 
 export function getInvestigationSandbox(env: Cloudflare.Env, threadId: string) {

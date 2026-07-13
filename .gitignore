@@ -18,3 +18,4 @@ dist/
 # Local research and internal planning
 /references/
 /docs/
+.firecrawl/
