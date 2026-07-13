@@ -3,12 +3,13 @@ import {
   defaultContextOverflowClassifier,
   Session,
   Think,
+  type PrepareStepContext,
   type ThinkSubmissionInspection,
 } from "@cloudflare/think";
 import { createExecuteTool } from "@cloudflare/think/tools/execute";
 import { getAgentByName } from "agents";
 import { createCompactFunction } from "agents/experimental/memory/utils";
-import { generateText, type UIMessage } from "ai";
+import { generateText, pruneMessages, type UIMessage } from "ai";
 import { z } from "zod";
 import { publishAutofix } from "../../investigation/autofix";
 import {
@@ -28,12 +29,18 @@ import { workspaceConfig } from "../../workspace.config";
 const CODE_EXECUTION_TIMEOUT_MS = 300_000;
 const INVESTIGATION_MODEL = "@cf/moonshotai/kimi-k2.6";
 const KIMI_K2_6_CONTEXT_TOKENS = 262_144;
+const MAX_OUTPUT_TOKENS = 8_192;
+const MAX_INPUT_TOKENS = KIMI_K2_6_CONTEXT_TOKENS - MAX_OUTPUT_TOKENS;
 // Compact durable history early; long single-turn investigations are guarded
 // separately at 80% of the provider context window below.
 const AUTO_COMPACTION_TOKENS = 160_000;
 // Keep enough recent evidence and tool exchanges to continue the active line
 // of inquiry after older observations have been summarized.
-const COMPACTION_TAIL_TOKENS = 32_000;
+const COMPACTION_TAIL_BUDGET = 32_000;
+
+function countMessageBytes(messages: readonly unknown[]): number {
+  return new TextEncoder().encode(JSON.stringify(messages)).byteLength;
+}
 
 /** The durable investigation transcript and case record for one Anomaly. */
 export class IncidentThread extends Think<Cloudflare.Env> {
@@ -43,7 +50,7 @@ export class IncidentThread extends Think<Cloudflare.Env> {
     reactive: true,
     maxRetries: 1,
     proactive: {
-      maxInputTokens: KIMI_K2_6_CONTEXT_TOKENS,
+      maxInputTokens: MAX_INPUT_TOKENS,
       headroom: 0.8,
       maxCompactions: 1,
     },
@@ -113,6 +120,22 @@ export class IncidentThread extends Think<Cloudflare.Env> {
     return INVESTIGATION_MODEL;
   }
 
+  override beforeTurn() {
+    return { maxOutputTokens: MAX_OUTPUT_TOKENS };
+  }
+
+  override beforeStep(ctx: PrepareStepContext) {
+    return {
+      // Keep conclusions, the briefing, and the latest complete tool exchange;
+      // discard only payloads that have already informed later model output.
+      messages: pruneMessages({
+        messages: ctx.messages,
+        reasoning: "before-last-message",
+        toolCalls: "before-last-2-messages",
+      }),
+    };
+  }
+
   override configureSession(session: Session) {
     return session
       .withContext("soul", {
@@ -136,8 +159,12 @@ export class IncidentThread extends Think<Cloudflare.Env> {
             return result.text;
           },
           protectHead: 3,
-          tailTokenBudget: COMPACTION_TAIL_TOKENS,
+          tailTokenBudget: COMPACTION_TAIL_BUDGET,
           minTailMessages: 4,
+          // A byte is a conservative upper bound for tokenizer output. Unlike
+          // the default chars/4 heuristic, this cannot protect an oversized
+          // tool-heavy tail and turn compaction into a no-op.
+          tokenCounter: countMessageBytes,
         }),
       )
       .compactAfter(AUTO_COMPACTION_TOKENS)
