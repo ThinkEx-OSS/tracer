@@ -31,6 +31,7 @@ const INVESTIGATION_MODEL = "@cf/moonshotai/kimi-k2.6";
 const KIMI_K2_6_CONTEXT_TOKENS = 262_144;
 const MAX_OUTPUT_TOKENS = 8_192;
 const MAX_INPUT_TOKENS = KIMI_K2_6_CONTEXT_TOKENS - MAX_OUTPUT_TOKENS;
+const ACTIVE_TURN_PRUNING_HEADROOM = 0.7;
 // Compact durable history early; long single-turn investigations are guarded
 // separately at 80% of the provider context window below.
 const AUTO_COMPACTION_TOKENS = 160_000;
@@ -130,9 +131,18 @@ export class IncidentThread extends Think<Cloudflare.Env> {
   }
 
   override beforeStep(ctx: PrepareStepContext) {
+    const inputTokens = ctx.steps.at(-1)?.usage.inputTokens;
+    if (
+      inputTokens === undefined ||
+      inputTokens < MAX_INPUT_TOKENS * ACTIVE_TURN_PRUNING_HEADROOM
+    ) {
+      return;
+    }
+
     return {
-      // Keep conclusions, the briefing, and the latest complete tool exchange;
-      // discard only payloads that have already informed later model output.
+      // Preserve the prompt byte-for-byte during normal investigation. Near
+      // the context limit, keep conclusions and the latest complete exchange
+      // while dropping only payloads that have informed later model output.
       messages: pruneMessages({
         messages: ctx.messages,
         reasoning: "before-last-message",
