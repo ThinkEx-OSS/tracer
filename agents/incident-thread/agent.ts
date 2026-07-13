@@ -1,6 +1,14 @@
-import { action, Session, Think } from "@cloudflare/think";
+import {
+  action,
+  defaultContextOverflowClassifier,
+  Session,
+  Think,
+  type ThinkSubmissionInspection,
+} from "@cloudflare/think";
 import { createExecuteTool } from "@cloudflare/think/tools/execute";
 import { getAgentByName } from "agents";
+import { createCompactFunction } from "agents/experimental/memory/utils";
+import { generateText, type UIMessage } from "ai";
 import { z } from "zod";
 import { publishAutofix } from "../../investigation/autofix";
 import {
@@ -10,15 +18,37 @@ import {
 } from "../../investigation/sandbox";
 import { createInvestigationTools } from "../../investigation/tools";
 import { SandboxWorkspace } from "../../investigation/workspace-fs";
+import {
+  type InvestigationSubmissionState,
+  submissionFailure,
+} from "../../investigation/submission";
 import type { InvestigationConfidence, InvestigationVerdict } from "../../shared/workspace";
 import { workspaceConfig } from "../../workspace.config";
 
 const CODE_EXECUTION_TIMEOUT_MS = 300_000;
+const INVESTIGATION_MODEL = "@cf/moonshotai/kimi-k2.6";
+const KIMI_K2_6_CONTEXT_TOKENS = 262_144;
+// Compact durable history early; long single-turn investigations are guarded
+// separately at 80% of the provider context window below.
+const AUTO_COMPACTION_TOKENS = 160_000;
+// Keep enough recent evidence and tool exchanges to continue the active line
+// of inquiry after older observations have been summarized.
+const COMPACTION_TAIL_TOKENS = 32_000;
 
 /** The durable investigation transcript and case record for one Anomaly. */
 export class IncidentThread extends Think<Cloudflare.Env> {
-  override maxSteps = 20;
+  override maxSteps = Number.POSITIVE_INFINITY;
   override chatStreamStallTimeoutMs = 150_000;
+  override contextOverflow = {
+    reactive: true,
+    maxRetries: 1,
+    proactive: {
+      maxInputTokens: KIMI_K2_6_CONTEXT_TOKENS,
+      headroom: 0.8,
+      maxCompactions: 1,
+    },
+  };
+  override classifyChatError = defaultContextOverflowClassifier;
 
   /**
    * The agent's single filesystem surface: the investigation container, rooted
@@ -39,12 +69,30 @@ export class IncidentThread extends Think<Cloudflare.Env> {
    */
   override workspaceBash = false;
 
-  async submitMonitorBriefing(input: { idempotencyKey: string; prompt: string }) {
+  async submitMonitorBriefing(input: { idempotencyKey: string; prompt: string }): Promise<void> {
     await this.runTurn({
       mode: "submit",
       idempotencyKey: input.idempotencyKey,
       input: input.prompt,
     });
+  }
+
+  async getMonitorSubmission(idempotencyKey: string): Promise<InvestigationSubmissionState | null> {
+    const submissions = await this.listSubmissions({ limit: 100 });
+    const submission = submissions.find((candidate) => candidate.idempotencyKey === idempotencyKey);
+    return submission ? { status: submission.status, error: submission.error } : null;
+  }
+
+  /** Server-side transcript snapshot used by the workspace monitor. */
+  async getTranscript(): Promise<UIMessage[]> {
+    return this.getMessages();
+  }
+
+  override async onSubmissionStatus(submission: ThinkSubmissionInspection) {
+    const error = submissionFailure(submission);
+    if (!error) return;
+    const monitor = await getAgentByName(this.env.ThinkAgent_WorkspaceMonitor, workspaceConfig.id);
+    await monitor.recordInvestigationFailure({ threadId: this.name, error });
   }
 
   /**
@@ -62,7 +110,7 @@ export class IncidentThread extends Think<Cloudflare.Env> {
   }
 
   override getModel() {
-    return "@cf/moonshotai/kimi-k2.7-code";
+    return INVESTIGATION_MODEL;
   }
 
   override configureSession(session: Session) {
@@ -80,7 +128,25 @@ export class IncidentThread extends Think<Cloudflare.Env> {
           "Durable investigation memory: verified system facts, useful repository locations, recurring evidence patterns, disproven hypotheses, and unresolved questions. Store concise facts with their source and time range; never store credentials, personal data, or speculative conclusions as facts.",
         maxTokens: 2_000,
       })
-      .withCachedPrompt();
+      .withCachedPrompt()
+      .onCompaction(
+        createCompactFunction({
+          summarize: async (prompt) => {
+            const result = await generateText({ model: this.resolveModel(), prompt });
+            return result.text;
+          },
+          protectHead: 3,
+          tailTokenBudget: COMPACTION_TAIL_TOKENS,
+          minTailMessages: 4,
+        }),
+      )
+      .compactAfter(AUTO_COMPACTION_TOKENS)
+      .onCompactionError((error) => {
+        console.error("Investigation session compaction failed", {
+          threadId: this.name,
+          error,
+        });
+      });
   }
 
   override getTools() {

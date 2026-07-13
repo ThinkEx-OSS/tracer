@@ -1,9 +1,12 @@
 import { Agent, callable, getAgentByName, type Schedule } from "agents";
-import { evaluateOperationCheck } from "../../checks/operation";
+import type { UIMessage } from "ai";
+import { evaluateMonitor } from "../../checks/monitor";
 import { configuredRepositoryPath } from "../../investigation/sandbox";
+import { InvestigationStore } from "../../investigation/store";
+import { submissionFailure } from "../../investigation/submission";
 import { getCloudflareContext } from "../../providers/cloudflare";
 import { providerErrorMessage } from "../../providers/http";
-import { queryOperationEvidence } from "../../providers/posthog";
+import { queryMonitorEvidence } from "../../providers/posthog";
 import {
   createInitialWorkspaceState,
   type Change,
@@ -14,14 +17,13 @@ import {
   type InvestigationStatus,
   type InvestigationSummary,
   type InvestigationVerdict,
-  type OperationCheck,
+  type MonitorDefinition,
   SIMULATION_RUN_PREFIX,
   type WorkspaceState,
 } from "../../shared/workspace";
 import { workspaceConfig } from "../../workspace.config";
 
 const STATE_HISTORY_LIMIT = 24;
-const INVESTIGATION_COOLDOWN_MS = 30 * 60 * 1_000;
 
 interface StoredCheckRun {
   payload: string;
@@ -35,20 +37,9 @@ interface StoredChange {
   summary: string;
 }
 
-interface StoredInvestigationSubmission {
-  check_id: string;
-  check_run_id: string;
-  submitted_at: string;
-  thread_id: string;
-  status: InvestigationStatus | null;
-  verdict: InvestigationVerdict | null;
-  confidence: InvestigationConfidence | null;
-  error_message: string | null;
-}
-
-function checkTime(check: OperationCheck) {
-  const bucketMs = check.bucketMinutes * 60 * 1_000;
-  return new Date(Math.floor(Date.now() / bucketMs) * bucketMs);
+function checkTime() {
+  const intervalMs = workspaceConfig.scheduleIntervalSeconds * 1_000;
+  return new Date(Math.floor(Date.now() / intervalMs) * intervalMs);
 }
 
 function investigationThreadId() {
@@ -83,6 +74,7 @@ function summarizeRun(run: CheckRun): CheckRunSummary {
 export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
   initialState = createInitialWorkspaceState(workspaceConfig.checks);
   private activeReconciliation?: Promise<WorkspaceState>;
+  private readonly investigations = new InvestigationStore(this);
 
   async onStart() {
     this.ensureSchema();
@@ -155,43 +147,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     `;
     void this
       .sql`CREATE INDEX IF NOT EXISTS workspace_changes_observed ON workspace_changes(observed_at DESC)`;
-    void this.sql`
-      CREATE TABLE IF NOT EXISTS investigation_submissions (
-        check_run_id TEXT PRIMARY KEY,
-        check_id TEXT NOT NULL,
-        thread_id TEXT NOT NULL,
-        submitted_at TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'investigating',
-        verdict TEXT,
-        confidence TEXT,
-        error_message TEXT,
-        updated_at TEXT
-      )
-    `;
-    // Backfill status columns for databases created before status tracking.
-    const columns = this.sql<{
-      name: string;
-    }>`PRAGMA table_info(investigation_submissions)`.map((row) => row.name);
-    if (!columns.includes("status")) {
-      void this
-        .sql`ALTER TABLE investigation_submissions ADD COLUMN status TEXT NOT NULL DEFAULT 'investigating'`;
-    }
-    if (!columns.includes("verdict")) {
-      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN verdict TEXT`;
-    }
-    if (!columns.includes("confidence")) {
-      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN confidence TEXT`;
-    }
-    if (!columns.includes("updated_at")) {
-      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN updated_at TEXT`;
-    }
-    if (!columns.includes("error_message")) {
-      void this.sql`ALTER TABLE investigation_submissions ADD COLUMN error_message TEXT`;
-    }
-    void this
-      .sql`CREATE INDEX IF NOT EXISTS investigation_submissions_submitted ON investigation_submissions(submitted_at DESC)`;
-    void this
-      .sql`CREATE INDEX IF NOT EXISTS investigation_submissions_thread_submitted ON investigation_submissions(thread_id, submitted_at DESC)`;
+    this.investigations.ensureSchema();
   }
 
   private findRun(id: string) {
@@ -261,23 +217,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
   }
 
   private loadInvestigations(): InvestigationSummary[] {
-    const rows = this.sql<StoredInvestigationSubmission>`
-      SELECT check_run_id, check_id, thread_id, submitted_at, status, verdict, confidence, error_message
-      FROM investigation_submissions
-      ORDER BY submitted_at DESC
-      LIMIT ${STATE_HISTORY_LIMIT}
-    `;
-    return rows.map((row) => ({
-      kind: row.check_run_id.startsWith(SIMULATION_RUN_PREFIX) ? "simulation" : "monitor",
-      status: row.status ?? "investigating",
-      checkId: row.check_id,
-      checkRunId: row.check_run_id,
-      submittedAt: row.submitted_at,
-      threadId: row.thread_id,
-      verdict: row.verdict ?? undefined,
-      confidence: row.confidence ?? undefined,
-      error: row.error_message ?? undefined,
-    }));
+    return this.investigations.load(STATE_HISTORY_LIMIT, parseCheckRun);
   }
 
   private updateInvestigationStatus(input: {
@@ -287,19 +227,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     confidence?: InvestigationConfidence;
     error?: string;
   }) {
-    const updated = this.sql<{ thread_id: string }>`
-      UPDATE investigation_submissions
-      SET status = ${input.status},
-          verdict = ${input.verdict ?? null},
-          confidence = ${input.confidence ?? null},
-          error_message = ${input.error ?? null},
-          updated_at = ${new Date().toISOString()}
-      WHERE thread_id = ${input.threadId}
-      RETURNING thread_id
-    `;
-    if (updated.length === 0) {
-      throw new Error(`Investigation ${input.threadId} was not found`);
-    }
+    this.investigations.update(input);
     this.setState({ ...this.state, investigations: this.loadInvestigations() });
   }
 
@@ -315,6 +243,76 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     confidence?: InvestigationConfidence;
   }): Promise<void> {
     this.updateInvestigationStatus(input);
+  }
+
+  async recordInvestigationFailure(input: { threadId: string; error: string }): Promise<void> {
+    if (this.investigations.failActive(input.threadId, input.error)) {
+      this.setState({ ...this.state, investigations: this.loadInvestigations() });
+    }
+  }
+
+  @callable()
+  async getInvestigationTranscript(threadId: string): Promise<UIMessage[]> {
+    if (!this.investigations.hasThread(threadId))
+      throw new Error(`Investigation ${threadId} was not found`);
+    const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, threadId);
+    return incident.getTranscript();
+  }
+
+  @callable()
+  async retryInvestigation(threadId: string): Promise<WorkspaceState> {
+    if (this.hasActiveInvestigation()) {
+      throw new Error("Another investigation is already running");
+    }
+    const investigation = this.investigations.findByThread(threadId);
+    if (!investigation) throw new Error(`Investigation ${threadId} was not found`);
+    if (investigation.status !== "failed") {
+      throw new Error("Only failed investigations can be retried");
+    }
+
+    const storedRun = this.findRun(investigation.check_run_id);
+    if (!storedRun) throw new Error("The check evidence for this investigation has expired");
+    const run = parseCheckRun(storedRun.payload);
+    if (run.status !== "deviation") throw new Error("The stored check is not a deviation");
+    const check = workspaceConfig.checks.find(
+      (candidate) => candidate.id === investigation.check_id,
+    );
+    if (!check) throw new Error(`Missing check configuration for ${investigation.check_id}`);
+
+    await this.destroyInvestigationThread(threadId);
+
+    const retryThreadId = investigationThreadId();
+    this.investigations.retry(investigation.check_run_id, retryThreadId);
+    this.setState({ ...this.state, investigations: this.loadInvestigations() });
+    this.ctx.waitUntil(
+      this.runInvestigation({
+        checkRunId: investigation.check_run_id,
+        prompt: buildInvestigationBriefing(check.name, run, this.loadChanges()),
+        threadId: retryThreadId,
+      }),
+    );
+    return this.state;
+  }
+
+  @callable()
+  async deleteInvestigation(threadId: string): Promise<WorkspaceState> {
+    const investigation = this.investigations.findByThread(threadId);
+    if (!investigation) throw new Error(`Investigation ${threadId} was not found`);
+    if (investigation.status === "investigating") {
+      throw new Error("An active investigation cannot be deleted");
+    }
+
+    await this.destroyInvestigationThread(threadId);
+
+    if (!this.investigations.delete(threadId))
+      throw new Error(`Investigation ${threadId} was not found`);
+    this.setState({ ...this.state, investigations: this.loadInvestigations() });
+    return this.state;
+  }
+
+  private async destroyInvestigationThread(threadId: string): Promise<void> {
+    const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, threadId);
+    await incident.destroy();
   }
 
   @callable()
@@ -336,12 +334,16 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
    */
   @callable()
   async simulateInvestigation(): Promise<WorkspaceState> {
+    if (this.hasActiveInvestigation()) {
+      throw new Error("Another investigation is already running");
+    }
     const runId = `${SIMULATION_RUN_PREFIX}${new Date().toISOString()}`;
     const checkId = workspaceConfig.checks[0]?.id ?? "simulation";
 
     this.dispatchInvestigation({
       checkId,
       checkRunId: runId,
+      evidenceKey: runId,
       prompt: buildSimulationBriefing(),
       threadId: investigationThreadId(),
     });
@@ -356,6 +358,8 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       checks: workspaceConfig.checks,
       warning: undefined,
     });
+
+    await this.reconcileInvestigationStatuses();
 
     const [latestRuns, cloudflareResult] = await Promise.all([
       Promise.all(workspaceConfig.checks.map((check) => this.runCheck(check))),
@@ -431,8 +435,32 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     return nextState;
   }
 
-  private async runCheck(check: OperationCheck): Promise<CheckRun> {
-    const now = checkTime(check);
+  private async reconcileInvestigationStatuses() {
+    const investigating = this.investigations.active(STATE_HISTORY_LIMIT);
+    await Promise.all(
+      investigating.map(async (row) => {
+        try {
+          const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, row.thread_id);
+          const submission = await incident.getMonitorSubmission(row.check_run_id);
+          const error = submission ? submissionFailure(submission) : undefined;
+          if (error) {
+            await this.recordInvestigationFailure({
+              threadId: row.thread_id,
+              error,
+            });
+          }
+        } catch (error) {
+          console.error("Investigation status reconciliation failed", {
+            threadId: row.thread_id,
+            error: providerErrorMessage(error, "Unknown investigation status error"),
+          });
+        }
+      }),
+    );
+  }
+
+  private async runCheck(check: MonitorDefinition): Promise<CheckRun> {
+    const now = checkTime();
     const runId = `${check.id}:${now.toISOString()}`;
     const existingRun = this.findRun(runId);
     if (existingRun && existingRun.status !== "failed") {
@@ -442,7 +470,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     const startedAt = new Date().toISOString();
     let run: CheckRun;
     try {
-      const evidence = await queryOperationEvidence(
+      const evidence = await queryMonitorEvidence(
         {
           host: this.env.POSTHOG_HOST,
           projectId: this.env.POSTHOG_PROJECT_ID,
@@ -454,12 +482,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       run = {
         id: runId,
         checkId: check.id,
-        ...evaluateOperationCheck(
-          check,
-          evidence.current.summary,
-          evidence.baseline.summary,
-          evidence.current.buckets,
-        ),
+        ...evaluateMonitor(check, evidence.current.summary, evidence.baseline.summary),
         startedAt,
         completedAt: new Date().toISOString(),
         current: evidence.current,
@@ -490,44 +513,33 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       return;
     }
 
-    const existing = this.sql`
-      SELECT check_run_id FROM investigation_submissions WHERE check_run_id = ${run.id} LIMIT 1
-    `[0];
-    if (existing) return;
+    if (this.investigations.hasEvidence(run.id, run.evidenceKey) || this.hasActiveInvestigation())
+      return;
 
     const check = workspaceConfig.checks.find((candidate) => candidate.id === run.checkId);
     if (!check) throw new Error(`Missing check configuration for ${run.checkId}`);
 
-    const cooldownStartedAt = new Date(Date.now() - INVESTIGATION_COOLDOWN_MS).toISOString();
-    const recentThreadSubmission = this.sql`
-      SELECT check_run_id
-      FROM investigation_submissions
-      WHERE check_id = ${run.checkId}
-        AND status != 'failed'
-        AND submitted_at >= ${cooldownStartedAt}
-      LIMIT 1
-    `[0];
-    if (recentThreadSubmission) return;
-
     this.dispatchInvestigation({
       checkId: run.checkId,
       checkRunId: run.id,
+      evidenceKey: run.evidenceKey,
       prompt: buildInvestigationBriefing(check.name, run, changes),
       threadId: investigationThreadId(),
     });
   }
 
+  private hasActiveInvestigation(): boolean {
+    return this.investigations.hasActive();
+  }
+
   private dispatchInvestigation(input: {
     checkId: string;
     checkRunId: string;
+    evidenceKey: string;
     prompt: string;
     threadId: string;
   }): void {
-    const submittedAt = new Date().toISOString();
-    void this.sql`
-      INSERT INTO investigation_submissions (check_run_id, check_id, thread_id, submitted_at)
-      VALUES (${input.checkRunId}, ${input.checkId}, ${input.threadId}, ${submittedAt})
-    `;
+    this.investigations.insert(input);
     this.setState({ ...this.state, investigations: this.loadInvestigations() });
     this.ctx.waitUntil(this.runInvestigation(input));
   }

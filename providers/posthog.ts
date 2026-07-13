@@ -1,12 +1,10 @@
 import type {
   EvidenceWindow,
-  OperationBucket,
-  OperationCheck,
-  OperationSummary,
+  MonitorDefinition,
+  MonitorSignal,
+  MonitorSummary,
 } from "../shared/workspace";
 import { fetchProviderJson, ProviderRequestError } from "./http";
-
-const MAX_BUCKETS = 500;
 
 interface PostHogConfig {
   host: string;
@@ -32,7 +30,7 @@ export interface OperationEvidence {
   cached: boolean;
 }
 
-const PROPERTY_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const PROPERTY_NAME = /^\$?[A-Za-z_][A-Za-z0-9_]*$/;
 
 function sqlString(value: string) {
   return `'${value.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
@@ -57,82 +55,81 @@ function numberAt(row: unknown[], index: number, nullable = false): number | nul
   return value;
 }
 
-function parseBuckets(response: HogQlResponse, bucketMinutes: number): OperationBucket[] {
-  return response.results.map((row) => {
-    const bucketValue = row[0];
-    if (typeof bucketValue !== "string") {
-      throw new ProviderRequestError("PostHog", "PostHog returned an incompatible bucket");
-    }
+type OperationSignal = Extract<MonitorSignal, { kind: "operation" }>;
+type SessionImpactSignal = Extract<MonitorSignal, { kind: "session_impact" }>;
 
-    const from = new Date(bucketValue);
-    if (Number.isNaN(from.getTime())) {
-      throw new ProviderRequestError("PostHog", "PostHog returned an invalid bucket time");
-    }
-    const attempts = numberAt(row, 1) ?? 0;
-    const successes = numberAt(row, 2) ?? 0;
-
-    return {
-      from: from.toISOString(),
-      to: new Date(from.getTime() + bucketMinutes * 60 * 1_000).toISOString(),
-      summary: {
-        attempts,
-        successes,
-        failures: numberAt(row, 3) ?? 0,
-        successRate: attempts === 0 ? null : successes / attempts,
-        p50DurationMs: numberAt(row, 4, true),
-        p95DurationMs: numberAt(row, 5, true),
-      },
-    };
-  });
-}
-
-function eventFilter(check: OperationCheck) {
-  if (check.outcome.kind === "property") {
-    return `event = ${sqlString(check.outcome.event)} AND ${property(check.outcome.property)} IN (${sqlList([...check.outcome.success, ...check.outcome.failure])})`;
+function eventFilter(signal: OperationSignal) {
+  if (signal.outcome.kind === "property") {
+    return `event = ${sqlString(signal.outcome.event)} AND ${property(signal.outcome.property)} IN (${sqlList([...signal.outcome.success, ...signal.outcome.failure])})`;
   }
-  return `event IN (${sqlList([...check.outcome.success, ...check.outcome.failure])})`;
+  if (signal.outcome.kind === "boolean_property") {
+    return `event = ${sqlString(signal.outcome.event)} AND ${property(signal.outcome.property)} IN (true, false)`;
+  }
+  return `event IN (${sqlList([...signal.outcome.success, ...signal.outcome.failure])})`;
 }
 
-function operationFilter(check: OperationCheck, from: string, to: string) {
-  const configuredFilters = Object.entries(check.filters ?? {}).map(([name, value]) => {
+function operationFilter(signal: OperationSignal, from: string, to: string) {
+  const configuredFilters = Object.entries(signal.filters ?? {}).map(([name, value]) => {
     const values = Array.isArray(value) ? value : [value];
     return `${property(name)} IN (${sqlList(values)})`;
   });
   return [
-    eventFilter(check),
+    eventFilter(signal),
     ...configuredFilters,
     `timestamp >= toDateTime(${sqlString(from)})`,
     `timestamp < toDateTime(${sqlString(to)})`,
   ].join(" AND ");
 }
 
-function aggregation(check: OperationCheck) {
+function aggregation(signal: OperationSignal) {
   const outcomes =
-    check.outcome.kind === "property"
+    signal.outcome.kind === "property"
       ? {
-          success: `${property(check.outcome.property)} IN (${sqlList(check.outcome.success)})`,
-          failure: `${property(check.outcome.property)} IN (${sqlList(check.outcome.failure)})`,
+          success: `${property(signal.outcome.property)} IN (${sqlList(signal.outcome.success)})`,
+          failure: `${property(signal.outcome.property)} IN (${sqlList(signal.outcome.failure)})`,
         }
-      : {
-          success: `event IN (${sqlList(check.outcome.success)})`,
-          failure: `event IN (${sqlList(check.outcome.failure)})`,
-        };
-  const duration = check.durationProperty
-    ? `quantile(0.5)(toFloat(${property(check.durationProperty)})), quantile(0.95)(toFloat(${property(check.durationProperty)}))`
+      : signal.outcome.kind === "boolean_property"
+        ? {
+            success: `${property(signal.outcome.property)} = true`,
+            failure: `${property(signal.outcome.property)} = false`,
+          }
+        : {
+            success: `event IN (${sqlList(signal.outcome.success)})`,
+            failure: `event IN (${sqlList(signal.outcome.failure)})`,
+          };
+  const duration = signal.durationProperty
+    ? `quantile(0.5)(toFloat(${property(signal.durationProperty)})), quantile(0.95)(toFloat(${property(signal.durationProperty)}))`
     : "NULL, NULL";
-  return `count(), countIf(${outcomes.success}), countIf(${outcomes.failure}), ${duration}`;
+  return `count(), countIf(${outcomes.success}), countIf(${outcomes.failure}), ${duration}, maxIf(timestamp, ${outcomes.failure})`;
 }
 
-function bucketQuery(check: OperationCheck, from: string, to: string) {
-  if (!Number.isInteger(check.bucketMinutes) || check.bucketMinutes < 1) {
-    throw new Error("PostHog bucket size must be a positive whole number of minutes");
+function affectedPredicate(signal: SessionImpactSignal) {
+  if (signal.affected.kind === "events") {
+    return `event IN (${sqlList(signal.affected.events)})`;
   }
-
-  return `SELECT toStartOfInterval(timestamp, INTERVAL ${check.bucketMinutes} MINUTE) AS bucket, ${aggregation(check)} FROM events WHERE ${operationFilter(check, from, to)} GROUP BY bucket ORDER BY bucket ASC LIMIT ${MAX_BUCKETS}`;
+  if (signal.affected.any.length === 0) {
+    throw new Error("Session impact numeric conditions cannot be empty");
+  }
+  const conditions = signal.affected.any
+    .map((condition) => `toFloatOrZero(${property(condition.property)}) > ${condition.greaterThan}`)
+    .join(" OR ");
+  return `event = ${sqlString(signal.affected.event)} AND (${conditions})`;
 }
 
-function summaryQuery(check: OperationCheck, from: string, to: string) {
-  return `SELECT ${aggregation(check)} FROM events WHERE ${operationFilter(check, from, to)}`;
+function sessionImpactQuery(signal: SessionImpactSignal, from: string, to: string) {
+  const affected = affectedPredicate(signal);
+  const relevantEvents =
+    signal.affected.kind === "events"
+      ? [signal.populationEvent, ...signal.affected.events]
+      : [signal.populationEvent, signal.affected.event];
+  const window = `timestamp >= toDateTime(${sqlString(from)}) AND timestamp < toDateTime(${sqlString(to)})`;
+  return `SELECT count(), countIf(affected = 0), countIf(affected = 1), NULL, NULL, maxIf(latest_failure, affected = 1) FROM (SELECT toString(${property("$session_id")}) AS session_id, countIf(event = ${sqlString(signal.populationEvent)}) > 0 AS population, countIf(${affected}) > 0 AS affected, maxIf(timestamp, ${affected}) AS latest_failure FROM events WHERE ${window} AND event IN (${sqlList(relevantEvents)}) GROUP BY session_id HAVING population AND notEmpty(session_id)) LIMIT 1`;
+}
+
+function summaryQuery(monitor: MonitorDefinition, from: string, to: string) {
+  return monitor.signal.kind === "operation"
+    ? `SELECT ${aggregation(monitor.signal)} FROM events WHERE ${operationFilter(monitor.signal, from, to)}`
+    : sessionImpactQuery(monitor.signal, from, to);
 }
 
 async function runQuery(config: PostHogConfig, query: string, name: string) {
@@ -181,67 +178,66 @@ export async function queryPostHog(
   };
 }
 
-function parseSummary(response: HogQlResponse): OperationSummary {
+function parseSummary(response: HogQlResponse): MonitorSummary {
   const row = response.results[0];
   if (!row) {
     throw new ProviderRequestError("PostHog", "PostHog returned no operation summary");
   }
   const attempts = numberAt(row, 0) ?? 0;
   const successes = numberAt(row, 1) ?? 0;
+  const failures = numberAt(row, 2) ?? 0;
+  const latestFailureValue = row[5];
+  const latestFailure =
+    failures === 0
+      ? null
+      : typeof latestFailureValue === "string"
+        ? new Date(latestFailureValue)
+        : undefined;
+  if (latestFailure === undefined || (latestFailure && Number.isNaN(latestFailure.getTime()))) {
+    throw new ProviderRequestError("PostHog", "PostHog returned an invalid failure time");
+  }
 
   return {
     attempts,
     successes,
-    failures: numberAt(row, 2) ?? 0,
+    failures,
     successRate: attempts === 0 ? null : successes / attempts,
     p50DurationMs: numberAt(row, 3, true),
     p95DurationMs: numberAt(row, 4, true),
+    latestFailureAt: latestFailure?.toISOString() ?? null,
   };
 }
 
-function window(
-  from: Date,
-  to: Date,
-  summary: OperationSummary,
-  buckets: OperationBucket[],
-): EvidenceWindow {
-  return { from: from.toISOString(), to: to.toISOString(), summary, buckets };
+function window(from: Date, to: Date, summary: MonitorSummary): EvidenceWindow {
+  return { from: from.toISOString(), to: to.toISOString(), summary };
 }
 
-export async function queryOperationEvidence(
+export async function queryMonitorEvidence(
   config: PostHogConfig,
-  check: OperationCheck,
+  monitor: MonitorDefinition,
   now: Date,
 ): Promise<OperationEvidence> {
-  const currentFrom = new Date(now.getTime() - check.currentWindowMinutes * 60 * 1_000);
-  const baselineFrom = new Date(currentFrom.getTime() - check.baselineWindowMinutes * 60 * 1_000);
+  const currentFrom = new Date(now.getTime() - monitor.currentWindowMinutes * 60 * 1_000);
+  const baselineFrom = new Date(currentFrom.getTime() - monitor.baselineWindowMinutes * 60 * 1_000);
   const currentFromIso = currentFrom.toISOString();
   const baselineFromIso = baselineFrom.toISOString();
   const nowIso = now.toISOString();
-  const [bucketResponse, currentResponse, baselineResponse] = await Promise.all([
-    runQuery(config, bucketQuery(check, currentFromIso, nowIso), `Tracer buckets: ${check.id}`),
+  const [currentResponse, baselineResponse] = await Promise.all([
     runQuery(
       config,
-      summaryQuery(check, currentFromIso, nowIso),
-      `Tracer current window: ${check.id}`,
+      summaryQuery(monitor, currentFromIso, nowIso),
+      `Tracer current window: ${monitor.id}`,
     ),
     runQuery(
       config,
-      summaryQuery(check, baselineFromIso, currentFromIso),
-      `Tracer baseline window: ${check.id}`,
+      summaryQuery(monitor, baselineFromIso, currentFromIso),
+      `Tracer baseline window: ${monitor.id}`,
     ),
   ]);
 
   return {
-    current: window(
-      currentFrom,
-      now,
-      parseSummary(currentResponse),
-      parseBuckets(bucketResponse, check.bucketMinutes),
-    ),
-    baseline: window(baselineFrom, currentFrom, parseSummary(baselineResponse), []),
-    cached: Boolean(
-      bucketResponse.is_cached || currentResponse.is_cached || baselineResponse.is_cached,
-    ),
+    current: window(currentFrom, now, parseSummary(currentResponse)),
+    baseline: window(baselineFrom, currentFrom, parseSummary(baselineResponse)),
+    cached: Boolean(currentResponse.is_cached || baselineResponse.is_cached),
   };
 }

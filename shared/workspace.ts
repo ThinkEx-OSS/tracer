@@ -16,64 +16,86 @@ export interface Deployment {
   versionIds: string[];
 }
 
-export interface OperationSummary {
+export interface MonitorSummary {
   attempts: number;
   successes: number;
   failures: number;
   successRate: number | null;
   p50DurationMs: number | null;
   p95DurationMs: number | null;
-}
-
-export interface OperationBucket {
-  from: string;
-  to: string;
-  summary: OperationSummary;
+  latestFailureAt: string | null;
 }
 
 export interface EvidenceWindow {
   from: string;
   to: string;
-  summary: OperationSummary;
-  buckets: OperationBucket[];
+  summary: MonitorSummary;
 }
 
-export interface OperationCheck {
-  id: string;
-  name: string;
-  outcome:
-    | {
-        kind: "property";
-        event: string;
-        property: string;
-        success: string[];
-        failure: string[];
-      }
-    | {
-        kind: "events";
-        success: string[];
-        failure: string[];
-      };
-  filters?: Record<string, string | string[]>;
-  durationProperty?: string;
-  currentWindowMinutes: number;
-  baselineWindowMinutes: number;
-  bucketMinutes: number;
-  minimumCurrentAttempts: number;
-  minimumBaselineAttempts: number;
-  minimumBucketAttempts: number;
-  minimumBreachedBuckets: number;
-  thresholds: {
-    successRate: {
+type OperationOutcome =
+  | {
+      kind: "property";
+      event: string;
+      property: string;
+      success: string[];
+      failure: string[];
+    }
+  | {
+      kind: "boolean_property";
+      event: string;
+      property: string;
+    }
+  | {
+      kind: "events";
+      success: string[];
+      failure: string[];
+    };
+
+export interface NumericCondition {
+  property: string;
+  greaterThan: number;
+}
+
+export type MonitorSignal =
+  | {
+      kind: "operation";
+      outcome: OperationOutcome;
+      filters?: Record<string, string | string[]>;
+      durationProperty?: string;
+    }
+  | {
+      kind: "session_impact";
+      populationEvent: string;
+      affected:
+        | { kind: "events"; events: string[] }
+        | { kind: "numeric"; event: string; any: NumericCondition[] };
+    };
+
+export type MonitorDetector =
+  | {
+      kind: "failure_or_baseline_shift";
+      minimumFailures: number;
+      absoluteDrop: number;
+      minimumFailureRate: number;
+      failureMultiplier: number;
+    }
+  | {
+      kind: "baseline_shift";
       absoluteDrop: number;
       minimumFailureRate: number;
       failureMultiplier: number;
     };
-    p95Duration?: {
-      absoluteIncreaseMs: number;
-      multiplier: number;
-    };
-  };
+
+export interface MonitorDefinition {
+  id: string;
+  name: string;
+  group: "experience" | "operation";
+  signal: MonitorSignal;
+  detector: MonitorDetector;
+  currentWindowMinutes: number;
+  baselineWindowMinutes: number;
+  minimumCurrentAttempts: number;
+  minimumBaselineAttempts: number;
 }
 
 export type CheckRunStatus = "healthy" | "insufficient_data" | "deviation" | "failed";
@@ -95,7 +117,10 @@ interface CheckRunEvidence {
 
 export type CompletedCheckRun = CheckRunBase &
   CheckRunEvidence &
-  ({ status: "healthy" | "insufficient_data" } | { status: "deviation"; deviation: DeviationKind });
+  (
+    | { status: "healthy" | "insufficient_data" }
+    | { status: "deviation"; deviation: DeviationKind; evidenceKey: string }
+  );
 
 export interface FailedCheckRun extends CheckRunBase {
   status: "failed";
@@ -128,6 +153,15 @@ export type InvestigationConfidence = "low" | "medium" | "high";
 /** Check-run ids for simulated investigations are prefixed so their origin is unambiguous. */
 export const SIMULATION_RUN_PREFIX = "simulation:";
 
+export interface InvestigationTrigger {
+  reason: string;
+  attempts?: number;
+  failures?: number;
+  successRate?: number | null;
+  from?: string;
+  to?: string;
+}
+
 export interface InvestigationSummary {
   kind: InvestigationKind;
   status: InvestigationStatus;
@@ -135,6 +169,7 @@ export interface InvestigationSummary {
   checkRunId: string;
   submittedAt: string;
   threadId: string;
+  trigger?: InvestigationTrigger;
   verdict?: InvestigationVerdict;
   confidence?: InvestigationConfidence;
   error?: string;
@@ -142,7 +177,7 @@ export interface InvestigationSummary {
 
 export interface WorkspaceState {
   status: "idle" | "checking" | "ready" | "partial" | "failed";
-  checks: OperationCheck[];
+  checks: MonitorDefinition[];
   latestRuns: CheckRun[];
   history: CheckRunSummary[];
   resource?: Resource;
@@ -152,7 +187,7 @@ export interface WorkspaceState {
   warning?: string;
 }
 
-export const createInitialWorkspaceState = (checks: OperationCheck[]): WorkspaceState => ({
+export const createInitialWorkspaceState = (checks: MonitorDefinition[]): WorkspaceState => ({
   status: "idle",
   checks,
   latestRuns: [],
