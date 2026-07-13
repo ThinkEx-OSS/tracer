@@ -1,12 +1,13 @@
-import { Badge } from "@cloudflare/kumo/components/badge";
-import { Text } from "@cloudflare/kumo/components/text";
+import { StatusBadge } from "./components/status-badge";
+import { Separator } from "./components/ui/separator";
 import { useAgent } from "agents/react";
-import { useEffect, useMemo, useState } from "react";
-import { createRoot } from "react-dom/client";
+import type { UIMessage } from "ai";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { createInitialWorkspaceState, type WorkspaceState } from "../shared/workspace";
 import { workspaceConfig } from "../workspace.config";
 import { CheckCard } from "./check-card";
-import { Investigations } from "./investigations";
+import { Investigations, type PendingInvestigationAction } from "./investigations";
 import "./styles.css";
 
 function workspaceStatus(status: WorkspaceState["status"]) {
@@ -41,14 +42,16 @@ function MonitorStatus({ workspace }: { workspace: WorkspaceState }) {
     : 0;
 
   return (
-    <Badge appearance="dot" variant={status.variant}>
-      <span className="monitor-status">
-        <span className="monitor-status-label">{status.label}</span>
+    <StatusBadge dot variant={status.variant}>
+      <span className="inline-flex items-baseline gap-1">
+        <span className="font-medium">{status.label}</span>
         {lastCompletedAt ? (
-          <span className="monitor-status-time">· {relativeDuration(elapsedSeconds)} ago</span>
+          <span className="text-[0.6875rem] font-normal text-current/70">
+            · {relativeDuration(elapsedSeconds)} ago
+          </span>
         ) : null}
       </span>
-    </Badge>
+    </StatusBadge>
   );
 }
 
@@ -57,13 +60,26 @@ function App() {
     createInitialWorkspaceState(workspaceConfig.checks),
   );
   const [checkError, setCheckError] = useState<string>();
-  const [simulationError, setSimulationError] = useState<string>();
+  const [investigationError, setInvestigationError] = useState<string>();
   const [simulating, setSimulating] = useState(false);
+  const [pendingInvestigationAction, setPendingInvestigationAction] =
+    useState<PendingInvestigationAction>();
   const workspaceAgent = useAgent<WorkspaceState>({
     agent: "workspace-monitor",
     name: workspaceConfig.id,
     onStateUpdate: setWorkspace,
   });
+  const workspaceAgentRef = useRef(workspaceAgent);
+  useEffect(() => {
+    workspaceAgentRef.current = workspaceAgent;
+  }, [workspaceAgent]);
+  const loadInvestigationTranscript = useCallback(
+    (threadId: string) =>
+      workspaceAgentRef.current.call<UIMessage[]>("getInvestigationTranscript", [threadId], {
+        timeout: 30_000,
+      }),
+    [],
+  );
 
   async function runCheck() {
     setCheckError(undefined);
@@ -78,7 +94,7 @@ function App() {
   }
 
   async function simulateInvestigation() {
-    setSimulationError(undefined);
+    setInvestigationError(undefined);
     setSimulating(true);
     try {
       const nextState = await workspaceAgent.call<WorkspaceState>("simulateInvestigation", [], {
@@ -86,36 +102,81 @@ function App() {
       });
       setWorkspace(nextState);
     } catch {
-      setSimulationError("The drill could not start. Verify provider access and try again.");
+      setInvestigationError("The drill could not start. Verify provider access and try again.");
     } finally {
       setSimulating(false);
     }
   }
 
+  async function retryInvestigation(threadId: string) {
+    setInvestigationError(undefined);
+    setPendingInvestigationAction({ kind: "retry", threadId });
+    try {
+      const nextState = await workspaceAgent.call<WorkspaceState>(
+        "retryInvestigation",
+        [threadId],
+        { timeout: 60_000 },
+      );
+      setWorkspace(nextState);
+    } catch {
+      setInvestigationError("The investigation could not be retried. Run checks and try again.");
+    } finally {
+      setPendingInvestigationAction(undefined);
+    }
+  }
+
+  async function deleteInvestigation(threadId: string) {
+    if (!window.confirm("Delete this investigation? This cannot be undone.")) return;
+    setInvestigationError(undefined);
+    setPendingInvestigationAction({ kind: "delete", threadId });
+    try {
+      const nextState = await workspaceAgent.call<WorkspaceState>(
+        "deleteInvestigation",
+        [threadId],
+        { timeout: 30_000 },
+      );
+      setWorkspace(nextState);
+    } catch {
+      setInvestigationError("The investigation could not be deleted. Try again.");
+    } finally {
+      setPendingInvestigationAction(undefined);
+    }
+  }
+
   return (
-    <div className="app-shell bg-kumo-canvas text-kumo-default">
-      <header className="topbar border-kumo-hairline">
-        <div className="content-width topbar-content">
-          <div className="brand-path">
-            <img alt="" className="brand-mark" src="/tracer-mark.svg" />
-            <Text variant="heading3" as="h1">
-              Tracer
-            </Text>
-            <span aria-hidden="true">/</span>
-            <Text variant="secondary">ThinkEx Production</Text>
+    <div className="h-screen w-full bg-[radial-gradient(circle_at_50%_-20%,rgb(255_255_255/0.04),transparent_35rem)] text-foreground">
+      <header className="border-b bg-background/90 py-4 backdrop-blur">
+        <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-6">
+          <div className="flex items-center gap-3">
+            <img
+              alt=""
+              className="-mr-1.5 size-6 -translate-y-px object-contain"
+              src="/tracer-mark.svg"
+            />
+            <h1 className="text-base font-semibold tracking-tight">Tracer</h1>
+            <span aria-hidden="true" className="text-border">
+              /
+            </span>
+            <span className="text-sm text-muted-foreground">ThinkEx Production</span>
           </div>
           <MonitorStatus workspace={workspace} />
         </div>
       </header>
 
-      <main className="transcript">
-        <div className="content-width workspace-content">
+      <main className="h-[calc(100vh-3.5625rem)] overflow-y-auto">
+        <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col gap-10 px-6 py-10 pb-16">
           <CheckCard error={checkError} onRun={() => void runCheck()} workspace={workspace} />
 
+          <Separator />
+
           <Investigations
-            error={simulationError}
+            error={investigationError}
             investigations={workspace.investigations}
+            loadTranscript={loadInvestigationTranscript}
+            onDelete={(threadId) => void deleteInvestigation(threadId)}
+            onRetry={(threadId) => void retryInvestigation(threadId)}
             onSimulate={() => void simulateInvestigation()}
+            pendingAction={pendingInvestigationAction}
             simulating={simulating}
           />
         </div>
@@ -126,9 +187,7 @@ function App() {
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing root element");
-const appRoot = createRoot(root);
+const rootHost = root as HTMLElement & { __tracerRoot?: Root };
+const appRoot = rootHost.__tracerRoot ?? createRoot(rootHost);
+rootHost.__tracerRoot = appRoot;
 appRoot.render(<App />);
-
-if (import.meta.hot) {
-  import.meta.hot.dispose(() => appRoot.unmount());
-}

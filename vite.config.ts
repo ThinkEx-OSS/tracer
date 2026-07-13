@@ -1,5 +1,6 @@
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { think } from "@cloudflare/think/vite";
+import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -30,9 +31,15 @@ function removeLocalSecretsFromBuild(): Plugin {
 }
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      "@": resolve(import.meta.dirname, "src"),
+    },
+  },
   plugins: [
     think({ allowNonVirtualMain: true }),
     react(),
+    tailwindcss(),
     cloudflare(),
     removeLocalSecretsFromBuild(),
   ],

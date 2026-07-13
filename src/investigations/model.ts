@@ -206,18 +206,48 @@ export function formatActivityBrief(counts: StepCounts): string | undefined {
 
 export interface InvestigationDescriptor {
   title: string;
-  origin: { label: string; variant: BadgeVariant };
 }
 
 export function describeInvestigation(summary: InvestigationSummary): InvestigationDescriptor {
   if (summary.kind === "simulation") {
-    return { title: "Simulation drill", origin: { label: "Drill", variant: "neutral" } };
+    return { title: "Simulation drill" };
   }
   const check = workspaceConfig.checks.find((candidate) => candidate.id === summary.checkId);
   return {
     title: check?.name ?? summary.checkId,
-    origin: { label: "Monitor", variant: "warning" },
   };
+}
+
+export function describeInvestigationTrigger(summary: InvestigationSummary): string {
+  const trigger = summary.trigger;
+  if (!trigger)
+    return summary.kind === "simulation"
+      ? "Manually started pipeline drill."
+      : "Monitor-triggered investigation.";
+
+  const metrics: string[] = [];
+  if (trigger.attempts !== undefined && trigger.failures !== undefined) {
+    metrics.push(
+      `${trigger.failures} ${trigger.failures === 1 ? "failure" : "failures"} across ${trigger.attempts} ${trigger.attempts === 1 ? "attempt" : "attempts"}`,
+    );
+  }
+  if (trigger.successRate !== undefined && trigger.successRate !== null) {
+    metrics.push(`${(trigger.successRate * 100).toFixed(1)}% success`);
+  }
+  if (trigger.from && trigger.to) {
+    const durationMinutes = Math.round(
+      (Date.parse(trigger.to) - Date.parse(trigger.from)) / 60_000,
+    );
+    if (Number.isFinite(durationMinutes) && durationMinutes > 0) {
+      metrics.push(
+        durationMinutes % 60 === 0
+          ? `${durationMinutes / 60}h evidence`
+          : `${durationMinutes}m evidence`,
+      );
+    }
+  }
+
+  return metrics.length > 0 ? `${trigger.reason} ${metrics.join(" · ")}` : trigger.reason;
 }
 
 const RELATIVE_TIME = new Intl.RelativeTimeFormat("en", { numeric: "auto" });

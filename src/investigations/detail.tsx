@@ -1,7 +1,12 @@
-import { Badge } from "@cloudflare/kumo/components/badge";
-import { Text } from "@cloudflare/kumo/components/text";
+import { StatusBadge } from "../components/status-badge";
+import { buttonVariants } from "../components/ui/button";
+import { Card, CardContent, CardHeader } from "../components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../components/ui/collapsible";
+import { cn } from "../lib/utils";
+import { ExternalLink } from "lucide-react";
+import { useState } from "react";
 import { Markdown } from "./markdown";
-import { type InvestigationLive, useInvestigationThread } from "./live";
+import { type InvestigationView, useInvestigationSnapshot } from "./live";
 import { type BadgeVariant, type StepEntry } from "./model";
 
 const STEP_STATUS: Record<StepEntry["status"], { label: string; variant: BadgeVariant }> = {
@@ -12,106 +17,121 @@ const STEP_STATUS: Record<StepEntry["status"], { label: string; variant: BadgeVa
 
 function IoBlock({ label, value }: { label: string; value: string }) {
   return (
-    <div className="step-io">
-      <Text as="strong" bold size="xs">
-        {label}
-      </Text>
-      <pre className="step-io-body border-kumo-hairline">{value}</pre>
+    <div className="grid gap-1.5">
+      <strong className="text-xs font-medium">{label}</strong>
+      <pre className="m-0 max-h-88 overflow-auto whitespace-pre-wrap break-words rounded-lg border bg-background p-3 font-mono text-xs leading-6 text-foreground/85">
+        {value}
+      </pre>
     </div>
   );
 }
 
-function StepDisclosure({ step, open }: { step: StepEntry; open: boolean }) {
+function StepDisclosure({ step }: { step: StepEntry }) {
+  const [open, setOpen] = useState(false);
   const presentation = STEP_STATUS[step.status];
   const hasDetail = Boolean(step.input || step.output || step.errorText);
   return (
-    <details className="entry-step border-kumo-hairline" open={open}>
-      <summary className="entry-step-head">
-        <Badge appearance="dot" variant={presentation.variant}>
+    <Collapsible
+      className="overflow-hidden rounded-lg border bg-card/60"
+      onOpenChange={setOpen}
+      open={open}
+    >
+      <CollapsibleTrigger className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left">
+        <StatusBadge dot variant={presentation.variant}>
           {presentation.label}
-        </Badge>
-        <Text as="strong" bold size="sm">
-          {step.tool}
-        </Text>
-      </summary>
-      {hasDetail ? (
-        <div className="entry-step-body">
-          {step.input ? <IoBlock label="Input" value={step.input} /> : null}
-          {step.output ? <IoBlock label="Output" value={step.output} /> : null}
-          {step.errorText ? <IoBlock label="Error" value={step.errorText} /> : null}
-        </div>
-      ) : (
-        <div className="entry-step-body">
-          <Text variant="secondary">No input or output was captured for this step.</Text>
-        </div>
-      )}
-    </details>
+        </StatusBadge>
+        <strong className="text-sm font-medium">{step.tool}</strong>
+        <span
+          aria-hidden="true"
+          className={cn(
+            "ml-auto text-xs text-muted-foreground transition-transform",
+            open && "rotate-90",
+          )}
+        >
+          ▸
+        </span>
+      </CollapsibleTrigger>
+      <CollapsibleContent className="grid gap-3 border-t px-3.5 py-3">
+        {hasDetail ? (
+          <>
+            {step.input ? <IoBlock label="Input" value={step.input} /> : null}
+            {step.output ? <IoBlock label="Output" value={step.output} /> : null}
+            {step.errorText ? <IoBlock label="Error" value={step.errorText} /> : null}
+          </>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            No input or output was captured for this step.
+          </p>
+        )}
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
-function InvestigationBody({ live }: { live: InvestigationLive }) {
+function InvestigationBody({ live }: { live: InvestigationView }) {
   const { timeline, busy, recovering } = live;
   const report = timeline.report;
   const feed = [...timeline.entries].reverse();
-  const lastRunningId = feed.find(
-    (entry): entry is StepEntry => entry.kind === "step" && entry.status !== "done",
-  )?.id;
 
   return (
-    <div className="case">
+    <div className="grid gap-5 p-5">
       {report ? (
-        <div className="case-report border-kumo-hairline">
-          <Text size="xs" variant="secondary">
-            {report.confidence} confidence
-          </Text>
-          <Markdown>{report.summary}</Markdown>
-        </div>
+        <Card className="gap-2 bg-card/70 py-4 shadow-none">
+          <CardHeader>
+            <span className="text-xs capitalize text-muted-foreground">
+              {report.confidence} confidence
+            </span>
+          </CardHeader>
+          <CardContent>
+            <Markdown>{report.summary}</Markdown>
+          </CardContent>
+        </Card>
       ) : null}
 
       {timeline.pullRequestUrl ? (
         <a
-          className="case-pr border-kumo-hairline"
+          className={cn(buttonVariants({ variant: "outline" }), "w-fit")}
           href={timeline.pullRequestUrl}
           rel="noreferrer"
           target="_blank"
         >
-          <Badge appearance="dot" variant="success">
+          <StatusBadge dot variant="success">
             Draft PR
-          </Badge>
+          </StatusBadge>
           View pull request
+          <ExternalLink aria-hidden="true" />
         </a>
       ) : null}
 
       {feed.length > 0 ? (
-        <div className="case-feed">
+        <div className="grid gap-2.5">
           {feed.map((entry) =>
             entry.kind === "note" ? (
-              <div className="entry-note" key={entry.id}>
+              <div className="max-w-4xl" key={entry.id}>
                 <Markdown>{entry.text}</Markdown>
               </div>
             ) : (
-              <StepDisclosure key={entry.id} open={entry.id === lastRunningId} step={entry} />
+              <StepDisclosure key={entry.id} step={entry} />
             ),
           )}
         </div>
       ) : busy ? (
-        <Text variant="secondary">
+        <p className="text-sm text-muted-foreground">
           {recovering ? "Resuming investigation…" : "Starting investigation…"}
-        </Text>
+        </p>
       ) : report ? null : (
-        <Text variant="secondary">Waiting for the investigator to respond.</Text>
+        <p className="text-sm text-muted-foreground">Waiting for the investigator to respond.</p>
       )}
     </div>
   );
 }
 
-/** Expanded detail when the parent already holds the live connection. */
-export function InvestigationDetail({ live }: { live: InvestigationLive }) {
+export function InvestigationDetail({ live }: { live: InvestigationView }) {
   return <InvestigationBody live={live} />;
 }
 
-/** Expanded detail for static rows (reported, was collapsed) — opens its own connection. */
 export function InvestigationDetailByThread({ threadId }: { threadId: string }) {
-  const live = useInvestigationThread(threadId);
+  const live = useInvestigationSnapshot(threadId);
+  if (live.error) return <p className="p-5 text-sm text-red-400">{live.error}</p>;
   return <InvestigationBody live={live} />;
 }

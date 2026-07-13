@@ -1,5 +1,10 @@
 {
   "extends": "agents/tsconfig",
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
   "include": [
     "agents",
     "investigation",
