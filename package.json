@@ -1,6 +1,7 @@
 {
   "name": "tracer",
   "version": "0.0.0",
+  "description": "Production monitoring and automated investigation service for ThinkEx.",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.11.0",
