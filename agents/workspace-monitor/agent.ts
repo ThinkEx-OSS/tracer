@@ -279,7 +279,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     );
     if (!check) throw new Error(`Missing check configuration for ${investigation.check_id}`);
 
-    await this.destroyInvestigationThread(threadId);
+    await this.scheduleInvestigationThreadDestroy(threadId);
 
     const retryThreadId = investigationThreadId();
     this.investigations.retry(investigation.check_run_id, retryThreadId);
@@ -302,7 +302,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       throw new Error("An active investigation cannot be deleted");
     }
 
-    await this.destroyInvestigationThread(threadId);
+    await this.scheduleInvestigationThreadDestroy(threadId);
 
     if (!this.investigations.delete(threadId))
       throw new Error(`Investigation ${threadId} was not found`);
@@ -310,9 +310,9 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     return this.state;
   }
 
-  private async destroyInvestigationThread(threadId: string): Promise<void> {
+  private async scheduleInvestigationThreadDestroy(threadId: string): Promise<void> {
     const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, threadId);
-    await incident.destroy();
+    await incident.scheduleDestroy();
   }
 
   @callable()

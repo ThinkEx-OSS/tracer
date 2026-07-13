@@ -95,6 +95,11 @@ export class IncidentThread extends Think<Cloudflare.Env> {
     return this.getMessages();
   }
 
+  /** Schedule teardown without aborting the caller's RPC invocation. */
+  async scheduleDestroy(): Promise<void> {
+    await this._cf_scheduleDestroy();
+  }
+
   override async onSubmissionStatus(submission: ThinkSubmissionInspection) {
     const error = submissionFailure(submission);
     if (!error) return;
