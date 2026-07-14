@@ -2,6 +2,12 @@ import { StatusBadge } from "../components/status-badge";
 import { FailureNotice } from "../components/failure-notice";
 import { Button } from "../components/ui/button";
 import { Card } from "../components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../components/ui/dropdown-menu";
 import { Empty, EmptyDescription, EmptyHeader } from "../components/ui/empty";
 import { Spinner } from "../components/ui/spinner";
 import { ChevronRight, Ellipsis, RotateCcw, Trash2 } from "lucide-react";
@@ -89,64 +95,31 @@ function InvestigationActions({
   pendingAction?: PendingInvestigationAction["kind"];
 }) {
   const busy = pendingAction !== undefined;
-  const itemClass =
-    "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-muted focus-visible:bg-muted disabled:pointer-events-none disabled:opacity-40";
 
   return (
-    <details
-      className="group relative"
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
-      }}
-      onKeyDown={(event) => {
-        if (event.key !== "Escape") return;
-        event.currentTarget.open = false;
-        event.currentTarget.querySelector("summary")?.focus();
-      }}
-    >
-      <summary
+    <DropdownMenu>
+      <DropdownMenuTrigger
         aria-label="Investigation actions"
-        aria-disabled={busy}
-        aria-haspopup="menu"
-        className="inline-flex size-7 list-none items-center justify-center rounded-lg text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 group-open:bg-muted [&::-webkit-details-marker]:hidden"
-        onClick={(event) => {
-          if (busy) event.preventDefault();
-        }}
+        className="inline-flex size-7 items-center justify-center rounded-lg text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 data-popup-open:bg-muted"
+        disabled={busy}
       >
         {busy ? <Spinner /> : <Ellipsis aria-hidden="true" className="size-4" />}
-      </summary>
-      <div
-        className="absolute right-0 z-50 mt-1 min-w-36 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md"
-        role="menu"
-      >
-        <button
-          className={itemClass}
-          disabled={investigation.status !== "failed"}
-          onClick={(event) => {
-            event.currentTarget.closest("details")?.removeAttribute("open");
-            onRetry();
-          }}
-          role="menuitem"
-          type="button"
-        >
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem disabled={investigation.status !== "failed"} onClick={onRetry}>
           <RotateCcw aria-hidden="true" className="size-3.5" />
           Retry
-        </button>
-        <button
-          className={`${itemClass} text-red-400 hover:bg-red-500/10 focus-visible:bg-red-500/10`}
+        </DropdownMenuItem>
+        <DropdownMenuItem
           disabled={investigation.status === "investigating"}
-          onClick={(event) => {
-            event.currentTarget.closest("details")?.removeAttribute("open");
-            onDelete();
-          }}
-          role="menuitem"
-          type="button"
+          onClick={onDelete}
+          variant="destructive"
         >
           <Trash2 aria-hidden="true" className="size-3.5" />
           Delete
-        </button>
-      </div>
-    </details>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
