@@ -1,3 +1,4 @@
+import { createFailure, parseFailure, type UserFacingFailure } from "../shared/failure";
 import type {
   CheckRun,
   InvestigationConfidence,
@@ -22,6 +23,7 @@ interface StoredInvestigation {
   verdict: InvestigationVerdict | null;
   confidence: InvestigationConfidence | null;
   error_message: string | null;
+  failure_json: string | null;
   check_run_payload: string | null;
 }
 
@@ -46,6 +48,7 @@ export class InvestigationStore {
         verdict TEXT,
         confidence TEXT,
         error_message TEXT,
+        failure_json TEXT,
         updated_at TEXT
       )
     `;
@@ -64,6 +67,8 @@ export class InvestigationStore {
       void this.database.sql`ALTER TABLE investigation_submissions ADD COLUMN updated_at TEXT`;
     if (!columns.includes("error_message"))
       void this.database.sql`ALTER TABLE investigation_submissions ADD COLUMN error_message TEXT`;
+    if (!columns.includes("failure_json"))
+      void this.database.sql`ALTER TABLE investigation_submissions ADD COLUMN failure_json TEXT`;
     if (!columns.includes("evidence_key"))
       void this.database.sql`ALTER TABLE investigation_submissions ADD COLUMN evidence_key TEXT`;
     void this.database
@@ -78,7 +83,7 @@ export class InvestigationStore {
     const rows = this.database.sql<StoredInvestigation>`
       SELECT submissions.check_run_id, submissions.check_id, submissions.thread_id,
              submissions.submitted_at, submissions.status, submissions.verdict,
-             submissions.confidence, submissions.error_message,
+             submissions.confidence, submissions.error_message, submissions.failure_json,
              runs.payload AS check_run_payload
       FROM investigation_submissions AS submissions
       LEFT JOIN check_runs AS runs ON runs.id = submissions.check_run_id
@@ -119,7 +124,17 @@ export class InvestigationStore {
         trigger,
         verdict: row.verdict ?? undefined,
         confidence: row.confidence ?? undefined,
-        error: row.error_message ?? undefined,
+        failure:
+          parseFailure(row.failure_json) ??
+          (row.error_message
+            ? createFailure({
+                code: "investigation_execution_failed",
+                message: row.error_message,
+                action: "Retry the investigation. If it fails again, check the provider setup.",
+                retryable: true,
+                source: "investigation",
+              })
+            : undefined),
       };
     });
   }
@@ -129,12 +144,14 @@ export class InvestigationStore {
     status: InvestigationStatus;
     verdict?: InvestigationVerdict;
     confidence?: InvestigationConfidence;
-    error?: string;
+    failure?: UserFacingFailure;
   }) {
     const updated = this.database.sql<{ thread_id: string }>`
       UPDATE investigation_submissions
       SET status = ${input.status}, verdict = ${input.verdict ?? null},
-          confidence = ${input.confidence ?? null}, error_message = ${input.error ?? null},
+          confidence = ${input.confidence ?? null},
+          error_message = ${input.failure?.message ?? null},
+          failure_json = ${input.failure ? JSON.stringify(input.failure) : null},
           updated_at = ${new Date().toISOString()}
       WHERE thread_id = ${input.threadId}
       RETURNING thread_id
@@ -142,11 +159,12 @@ export class InvestigationStore {
     if (updated.length === 0) throw new Error(`Investigation ${input.threadId} was not found`);
   }
 
-  failActive(threadId: string, error: string) {
+  failActive(threadId: string, failure: UserFacingFailure) {
     return (
       this.database.sql<{ thread_id: string }>`
       UPDATE investigation_submissions
-      SET status = 'failed', error_message = ${error}, updated_at = ${new Date().toISOString()}
+      SET status = 'failed', error_message = ${failure.message},
+          failure_json = ${JSON.stringify(failure)}, updated_at = ${new Date().toISOString()}
       WHERE thread_id = ${threadId} AND status = 'investigating'
       RETURNING thread_id
     `.length > 0
@@ -203,7 +221,8 @@ export class InvestigationStore {
     void this.database.sql`
       UPDATE investigation_submissions
       SET thread_id = ${threadId}, submitted_at = ${submittedAt}, status = 'investigating',
-          verdict = NULL, confidence = NULL, error_message = NULL, updated_at = ${submittedAt}
+          verdict = NULL, confidence = NULL, error_message = NULL, failure_json = NULL,
+          updated_at = ${submittedAt}
       WHERE check_run_id = ${checkRunId}
     `;
   }

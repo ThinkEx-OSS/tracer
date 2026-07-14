@@ -29,8 +29,6 @@ import { workspaceConfig } from "../../workspace.config";
 const CODE_EXECUTION_TIMEOUT_MS = 300_000;
 const INVESTIGATION_MODEL = "@cf/moonshotai/kimi-k2.6";
 const KIMI_K2_6_CONTEXT_TOKENS = 262_144;
-const MAX_OUTPUT_TOKENS = 8_192;
-const MAX_INPUT_TOKENS = KIMI_K2_6_CONTEXT_TOKENS - MAX_OUTPUT_TOKENS;
 const ACTIVE_TURN_PRUNING_HEADROOM = 0.7;
 // Compact durable history early; long single-turn investigations are guarded
 // separately at 80% of the provider context window below.
@@ -51,7 +49,7 @@ export class IncidentThread extends Think<Cloudflare.Env> {
     reactive: true,
     maxRetries: 1,
     proactive: {
-      maxInputTokens: MAX_INPUT_TOKENS,
+      maxInputTokens: KIMI_K2_6_CONTEXT_TOKENS,
       headroom: 0.8,
       maxCompactions: 1,
     },
@@ -102,10 +100,23 @@ export class IncidentThread extends Think<Cloudflare.Env> {
   }
 
   override async onSubmissionStatus(submission: ThinkSubmissionInspection) {
-    const error = submissionFailure(submission);
-    if (!error) return;
+    const failure = submissionFailure(submission);
+    if (!failure) return;
+    const reference = crypto.randomUUID();
+    console.error(
+      JSON.stringify({
+        message: "investigation.submission.failed",
+        threadId: this.name,
+        status: submission.status,
+        reference,
+        error: submission.error?.slice(0, 4_000),
+      }),
+    );
     const monitor = await getAgentByName(this.env.ThinkAgent_WorkspaceMonitor, workspaceConfig.id);
-    await monitor.recordInvestigationFailure({ threadId: this.name, error });
+    await monitor.recordInvestigationFailure({
+      threadId: this.name,
+      failure: { ...failure, reference },
+    });
   }
 
   /**
@@ -126,15 +137,11 @@ export class IncidentThread extends Think<Cloudflare.Env> {
     return INVESTIGATION_MODEL;
   }
 
-  override beforeTurn() {
-    return { maxOutputTokens: MAX_OUTPUT_TOKENS };
-  }
-
   override beforeStep(ctx: PrepareStepContext) {
     const inputTokens = ctx.steps.at(-1)?.usage.inputTokens;
     if (
       inputTokens === undefined ||
-      inputTokens < MAX_INPUT_TOKENS * ACTIVE_TURN_PRUNING_HEADROOM
+      inputTokens < KIMI_K2_6_CONTEXT_TOKENS * ACTIVE_TURN_PRUNING_HEADROOM
     ) {
       return;
     }

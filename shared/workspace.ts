@@ -1,3 +1,5 @@
+import type { UserFacingFailure } from "./failure";
+
 export interface Resource {
   id: string;
   provider: "cloudflare";
@@ -124,6 +126,7 @@ export type CompletedCheckRun = CheckRunBase &
 
 export interface FailedCheckRun extends CheckRunBase {
   status: "failed";
+  failure?: UserFacingFailure;
 }
 
 export type CheckRun = CompletedCheckRun | FailedCheckRun;
@@ -172,7 +175,7 @@ export interface InvestigationSummary {
   trigger?: InvestigationTrigger;
   verdict?: InvestigationVerdict;
   confidence?: InvestigationConfidence;
-  error?: string;
+  failure?: UserFacingFailure;
 }
 
 export interface WorkspaceState {
@@ -184,7 +187,7 @@ export interface WorkspaceState {
   deployments: Deployment[];
   changes: Change[];
   investigations: InvestigationSummary[];
-  warning?: string;
+  warnings: UserFacingFailure[];
 }
 
 export const createInitialWorkspaceState = (checks: MonitorDefinition[]): WorkspaceState => ({
@@ -195,4 +198,5 @@ export const createInitialWorkspaceState = (checks: MonitorDefinition[]): Worksp
   deployments: [],
   changes: [],
   investigations: [],
+  warnings: [],
 });

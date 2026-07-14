@@ -5,8 +5,16 @@ import { configuredRepositoryPath } from "../../investigation/sandbox";
 import { InvestigationStore } from "../../investigation/store";
 import { submissionFailure } from "../../investigation/submission";
 import { getCloudflareContext } from "../../providers/cloudflare";
-import { providerErrorMessage } from "../../providers/http";
+import { providerFailure } from "../../providers/http";
 import { queryMonitorEvidence } from "../../providers/posthog";
+import {
+  commandFailure,
+  commandSuccess,
+  createFailure,
+  type CommandResult,
+  type FailureSource,
+  type UserFacingFailure,
+} from "../../shared/failure";
 import {
   createInitialWorkspaceState,
   type Change,
@@ -103,6 +111,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     const previous = this.state as WorkspaceState & {
       latestRun?: CheckRun;
       activeInvestigation?: InvestigationSummary;
+      warning?: string;
     };
     this.setState({
       status: previous.status ?? "idle",
@@ -121,7 +130,19 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
         : previous.activeInvestigation
           ? [previous.activeInvestigation]
           : [],
-      warning: previous.warning,
+      warnings: Array.isArray(previous.warnings)
+        ? previous.warnings
+        : previous.warning
+          ? [
+              createFailure({
+                code: "unexpected",
+                message: previous.warning,
+                action: "Run the checks again. If this persists, inspect the service logs.",
+                retryable: true,
+                source: "monitor",
+              }),
+            ]
+          : [],
     });
   }
 
@@ -225,7 +246,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     status: InvestigationStatus;
     verdict?: InvestigationVerdict;
     confidence?: InvestigationConfidence;
-    error?: string;
+    failure?: UserFacingFailure;
   }) {
     this.investigations.update(input);
     this.setState({ ...this.state, investigations: this.loadInvestigations() });
@@ -245,41 +266,106 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     this.updateInvestigationStatus(input);
   }
 
-  async recordInvestigationFailure(input: { threadId: string; error: string }): Promise<void> {
-    if (this.investigations.failActive(input.threadId, input.error)) {
+  async recordInvestigationFailure(input: {
+    threadId: string;
+    failure: UserFacingFailure;
+  }): Promise<void> {
+    if (this.investigations.failActive(input.threadId, input.failure)) {
       this.setState({ ...this.state, investigations: this.loadInvestigations() });
     }
   }
 
   @callable()
-  async getInvestigationTranscript(threadId: string): Promise<UIMessage[]> {
-    if (!this.investigations.hasThread(threadId))
-      throw new Error(`Investigation ${threadId} was not found`);
-    const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, threadId);
-    return incident.getTranscript();
+  async getInvestigationTranscript(threadId: string): Promise<CommandResult<UIMessage[]>> {
+    try {
+      if (!this.investigations.hasThread(threadId)) {
+        return commandFailure(this.investigationNotFoundFailure());
+      }
+      const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, threadId);
+      return commandSuccess(await Promise.resolve(incident.getTranscript()));
+    } catch (error) {
+      return commandFailure(this.unexpectedFailure("load_transcript", error, "investigation"));
+    }
   }
 
   @callable()
-  async retryInvestigation(threadId: string): Promise<WorkspaceState> {
+  async retryInvestigation(threadId: string): Promise<CommandResult<WorkspaceState>> {
+    try {
+      return await this.retryInvestigationCommand(threadId);
+    } catch (error) {
+      return commandFailure(this.unexpectedFailure("retry_investigation", error, "investigation"));
+    }
+  }
+
+  private async retryInvestigationCommand(
+    threadId: string,
+  ): Promise<CommandResult<WorkspaceState>> {
     if (this.hasActiveInvestigation()) {
-      throw new Error("Another investigation is already running");
+      return commandFailure(this.activeInvestigationFailure());
     }
     const investigation = this.investigations.findByThread(threadId);
-    if (!investigation) throw new Error(`Investigation ${threadId} was not found`);
+    if (!investigation) return commandFailure(this.investigationNotFoundFailure());
     if (investigation.status !== "failed") {
-      throw new Error("Only failed investigations can be retried");
+      return commandFailure(
+        createFailure({
+          code: "investigation_not_failed",
+          message: "Only failed investigations can be retried.",
+          action: "Wait for the active investigation to finish.",
+          retryable: false,
+          source: "investigation",
+        }),
+      );
     }
 
     const storedRun = this.findRun(investigation.check_run_id);
-    if (!storedRun) throw new Error("The check evidence for this investigation has expired");
-    const run = parseCheckRun(storedRun.payload);
-    if (run.status !== "deviation") throw new Error("The stored check is not a deviation");
+    if (!storedRun) {
+      return commandFailure(
+        createFailure({
+          code: "investigation_evidence_expired",
+          message: "The evidence for this investigation has expired.",
+          action: "Run the checks again to collect fresh evidence.",
+          retryable: false,
+          source: "investigation",
+        }),
+      );
+    }
+    let run: CheckRun;
+    try {
+      run = parseCheckRun(storedRun.payload);
+    } catch (error) {
+      return commandFailure(this.unexpectedFailure("parse_retry_evidence", error, "investigation"));
+    }
+    if (run.status !== "deviation") {
+      return commandFailure(
+        createFailure({
+          code: "investigation_evidence_invalid",
+          message: "The stored evidence is no longer a deviation.",
+          action: "Run the checks again before starting another investigation.",
+          retryable: false,
+          source: "investigation",
+        }),
+      );
+    }
     const check = workspaceConfig.checks.find(
       (candidate) => candidate.id === investigation.check_id,
     );
-    if (!check) throw new Error(`Missing check configuration for ${investigation.check_id}`);
+    if (!check) {
+      return commandFailure(
+        createFailure({
+          code: "investigation_configuration_missing",
+          message: "The monitor configuration used by this investigation is missing.",
+          action: "Restore the monitor configuration, then run the checks again.",
+          retryable: false,
+          source: "investigation",
+        }),
+      );
+    }
 
-    await this.scheduleInvestigationThreadDestroy(threadId);
+    try {
+      await this.scheduleInvestigationThreadDestroy(threadId);
+    } catch (error) {
+      return commandFailure(this.unexpectedFailure("destroy_retry_thread", error, "container"));
+    }
 
     const retryThreadId = investigationThreadId();
     this.investigations.retry(investigation.check_run_id, retryThreadId);
@@ -291,28 +377,88 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
         threadId: retryThreadId,
       }),
     );
-    return this.state;
+    return commandSuccess(this.state);
   }
 
   @callable()
-  async deleteInvestigation(threadId: string): Promise<WorkspaceState> {
+  async deleteInvestigation(threadId: string): Promise<CommandResult<WorkspaceState>> {
+    try {
+      return await this.deleteInvestigationCommand(threadId);
+    } catch (error) {
+      return commandFailure(this.unexpectedFailure("delete_investigation", error, "investigation"));
+    }
+  }
+
+  private async deleteInvestigationCommand(
+    threadId: string,
+  ): Promise<CommandResult<WorkspaceState>> {
     const investigation = this.investigations.findByThread(threadId);
-    if (!investigation) throw new Error(`Investigation ${threadId} was not found`);
+    if (!investigation) return commandFailure(this.investigationNotFoundFailure());
     if (investigation.status === "investigating") {
-      throw new Error("An active investigation cannot be deleted");
+      return commandFailure(
+        this.activeInvestigationFailure("An active investigation cannot be deleted."),
+      );
     }
 
-    await this.scheduleInvestigationThreadDestroy(threadId);
+    try {
+      await this.scheduleInvestigationThreadDestroy(threadId);
+    } catch (error) {
+      return commandFailure(this.unexpectedFailure("destroy_deleted_thread", error, "container"));
+    }
 
     if (!this.investigations.delete(threadId))
-      throw new Error(`Investigation ${threadId} was not found`);
+      return commandFailure(this.investigationNotFoundFailure());
     this.setState({ ...this.state, investigations: this.loadInvestigations() });
-    return this.state;
+    return commandSuccess(this.state);
   }
 
   private async scheduleInvestigationThreadDestroy(threadId: string): Promise<void> {
     const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, threadId);
     await incident.scheduleDestroy();
+  }
+
+  private investigationNotFoundFailure() {
+    return createFailure({
+      code: "investigation_not_found",
+      message: "This investigation no longer exists.",
+      action: "Return to the investigation list and choose another investigation.",
+      retryable: false,
+      source: "investigation",
+    });
+  }
+
+  private activeInvestigationFailure(message = "Another investigation is already running.") {
+    return createFailure({
+      code: "investigation_active",
+      message,
+      action: "Wait for the active investigation to finish, then try again.",
+      retryable: true,
+      source: "investigation",
+    });
+  }
+
+  private unexpectedFailure(
+    operation: string,
+    error: unknown,
+    source: FailureSource,
+  ): UserFacingFailure {
+    const reference = crypto.randomUUID();
+    console.error(
+      JSON.stringify({
+        message: "workspace.command.failed",
+        operation,
+        reference,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return createFailure({
+      code: "unexpected",
+      message: "Tracer could not complete the request.",
+      action: "Try again. If it keeps failing, use the reference to inspect logs.",
+      retryable: true,
+      source,
+      reference,
+    });
   }
 
   @callable()
@@ -327,15 +473,34 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     }
   }
 
+  @callable()
+  async runChecks(): Promise<CommandResult<WorkspaceState>> {
+    try {
+      return commandSuccess(await this.reconcile());
+    } catch (error) {
+      return commandFailure(this.unexpectedFailure("run_checks", error, "monitor"));
+    }
+  }
+
   /**
    * Starts a synthetic investigation to exercise the full pipeline end to end
    * (clone repo, investigate, write a report, open a draft PR) without waiting
    * for a real deviation. For testing the investigation path only.
    */
   @callable()
-  async simulateInvestigation(): Promise<WorkspaceState> {
+  async simulateInvestigation(): Promise<CommandResult<WorkspaceState>> {
+    try {
+      return this.simulateInvestigationCommand();
+    } catch (error) {
+      return commandFailure(
+        this.unexpectedFailure("simulate_investigation", error, "investigation"),
+      );
+    }
+  }
+
+  private simulateInvestigationCommand(): CommandResult<WorkspaceState> {
     if (this.hasActiveInvestigation()) {
-      throw new Error("Another investigation is already running");
+      return commandFailure(this.activeInvestigationFailure());
     }
     const runId = `${SIMULATION_RUN_PREFIX}${new Date().toISOString()}`;
     const checkId = workspaceConfig.checks[0]?.id ?? "simulation";
@@ -347,7 +512,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       prompt: buildSimulationBriefing(),
       threadId: investigationThreadId(),
     });
-    return this.state;
+    return commandSuccess(this.state);
   }
 
   private async performReconciliation(): Promise<WorkspaceState> {
@@ -356,12 +521,11 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       ...this.state,
       status: "checking",
       checks: workspaceConfig.checks,
-      warning: undefined,
+      warnings: [],
     });
 
-    await this.reconcileInvestigationStatuses();
-
-    const [latestRuns, cloudflareResult] = await Promise.all([
+    const [warnings, latestRuns, cloudflareResult] = await Promise.all([
+      this.reconcileInvestigationStatuses(),
       Promise.all(workspaceConfig.checks.map((check) => this.runCheck(check))),
       getCloudflareContext(
         {
@@ -379,27 +543,24 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       this.recordDeploymentChanges(cloudflareResult.value.deployments);
     }
 
-    const cloudflareWarning =
-      cloudflareResult.status === "rejected"
-        ? providerErrorMessage(cloudflareResult.reason, "Cloudflare context refresh failed")
-        : undefined;
+    if (cloudflareResult.status === "rejected") {
+      warnings.push(providerFailure(cloudflareResult.reason, "Cloudflare context refresh failed"));
+    }
     const failedChecks = latestRuns.filter((run) => run.status === "failed").length;
     const changes = this.loadChanges();
-    let investigationWarning: string | undefined;
     for (const run of latestRuns) {
       try {
-        this.submitInvestigation(run, changes);
+        const failure = this.submitInvestigation(run, changes);
+        if (failure) warnings.push(failure);
       } catch (error) {
-        investigationWarning = providerErrorMessage(error, "Investigation handoff failed");
+        warnings.push(this.unexpectedFailure("submit_investigation", error, "investigation"));
       }
     }
-    const warning =
-      [cloudflareWarning, investigationWarning].filter(Boolean).join(" ") || undefined;
     const nextState: WorkspaceState = {
       status:
         failedChecks === latestRuns.length
           ? "failed"
-          : failedChecks > 0 || warning
+          : failedChecks > 0 || warnings.length > 0
             ? "partial"
             : "ready",
       checks: workspaceConfig.checks,
@@ -415,7 +576,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
           : this.state.deployments,
       changes,
       investigations: this.loadInvestigations(),
-      warning,
+      warnings,
     };
 
     this.setState(nextState);
@@ -435,28 +596,32 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     return nextState;
   }
 
-  private async reconcileInvestigationStatuses() {
+  private async reconcileInvestigationStatuses(): Promise<UserFacingFailure[]> {
+    const warnings: UserFacingFailure[] = [];
     const investigating = this.investigations.active(STATE_HISTORY_LIMIT);
     await Promise.all(
       investigating.map(async (row) => {
         try {
           const incident = await getAgentByName(this.env.ThinkAgent_IncidentThread, row.thread_id);
           const submission = await incident.getMonitorSubmission(row.check_run_id);
-          const error = submission ? submissionFailure(submission) : undefined;
-          if (error) {
+          const failure = submission ? submissionFailure(submission) : undefined;
+          if (failure) {
             await this.recordInvestigationFailure({
               threadId: row.thread_id,
-              error,
+              failure,
             });
           }
         } catch (error) {
-          console.error("Investigation status reconciliation failed", {
-            threadId: row.thread_id,
-            error: providerErrorMessage(error, "Unknown investigation status error"),
-          });
+          const failure = this.unexpectedFailure(
+            "reconcile_investigation_status",
+            error,
+            "investigation",
+          );
+          warnings.push(failure);
         }
       }),
     );
+    return warnings;
   }
 
   private async runCheck(check: MonitorDefinition): Promise<CheckRun> {
@@ -490,13 +655,15 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
         cached: evidence.cached,
       };
     } catch (error) {
+      const failure = providerFailure(error, `PostHog check ${check.name} failed`);
       run = {
         id: runId,
         checkId: check.id,
         status: "failed",
         startedAt,
         completedAt: new Date().toISOString(),
-        reason: providerErrorMessage(error, `PostHog check ${check.name} failed`),
+        reason: failure.message,
+        failure,
       };
     }
 
@@ -504,7 +671,7 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
     return run;
   }
 
-  private submitInvestigation(run: CheckRun, changes: Change[]): void {
+  private submitInvestigation(run: CheckRun, changes: Change[]): UserFacingFailure | undefined {
     if (
       run.status !== "deviation" ||
       !("deviation" in run) ||
@@ -517,7 +684,16 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
       return;
 
     const check = workspaceConfig.checks.find((candidate) => candidate.id === run.checkId);
-    if (!check) throw new Error(`Missing check configuration for ${run.checkId}`);
+    if (!check) {
+      return createFailure({
+        code: "investigation_configuration_missing",
+        message:
+          "Tracer could not start an investigation because its monitor configuration is missing.",
+        action: "Restore the monitor configuration, then run the checks again.",
+        retryable: false,
+        source: "investigation",
+      });
+    }
 
     this.dispatchInvestigation({
       checkId: run.checkId,
@@ -552,18 +728,19 @@ export class WorkspaceMonitor extends Agent<Cloudflare.Env, WorkspaceState> {
         prompt: input.prompt,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Investigation failed";
+      const failure = this.unexpectedFailure("run_investigation", error, "investigation");
       this.updateInvestigationStatus({
         threadId: input.threadId,
         status: "failed",
-        error: message,
+        failure,
       });
       console.log(
         JSON.stringify({
           message: "investigation.run.failed",
           threadId: input.threadId,
           checkRunId: input.checkRunId,
-          error: message,
+          reference: failure.reference,
+          error: error instanceof Error ? error.message : String(error),
         }),
       );
     }

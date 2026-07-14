@@ -116,21 +116,15 @@ export class SandboxWorkspace {
   }
 
   async readFile(path: string): Promise<string | null> {
-    try {
-      const result = await this.getSandbox().readFile(path, { encoding: "utf-8" });
-      return result.content;
-    } catch {
-      return null;
-    }
+    if (!(await this.exists(path))) return null;
+    const result = await this.getSandbox().readFile(path, { encoding: "utf-8" });
+    return result.content;
   }
 
   async readFileBytes(path: string): Promise<Uint8Array | null> {
-    try {
-      const result = await this.getSandbox().readFile(path, { encoding: "base64" });
-      return base64ToBytes(result.content);
-    } catch {
-      return null;
-    }
+    if (!(await this.exists(path))) return null;
+    const result = await this.getSandbox().readFile(path, { encoding: "base64" });
+    return base64ToBytes(result.content);
   }
 
   async writeFile(path: string, content: string): Promise<void> {
@@ -163,9 +157,12 @@ export class SandboxWorkspace {
   }
 
   private async statInternal(path: string, follow: boolean): Promise<WorkspaceFileInfo | null> {
+    if (!(await this.exists(path))) return null;
     const deref = follow ? "-L " : "";
     const result = await this.exec(`stat ${deref}-c '%F|%s|%Y' -- ${shellQuote(path)}`);
-    if (result.exitCode !== 0) return null;
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.trim() || `Failed to inspect ${path}`);
+    }
     const [rawType, rawSize, rawMtime] = result.stdout.trim().split("|");
     const type = mapType(rawType ?? "");
     const mtimeMs = (Number(rawMtime) || 0) * 1_000;
@@ -193,12 +190,8 @@ export class SandboxWorkspace {
     dir: string = this.rootDir,
     opts?: { limit?: number; offset?: number },
   ): Promise<WorkspaceFileInfo[]> {
-    let listing;
-    try {
-      listing = await this.getSandbox().listFiles(dir, {});
-    } catch {
-      return [];
-    }
+    if (!(await this.exists(dir))) return [];
+    const listing = await this.getSandbox().listFiles(dir, {});
     const offset = opts?.offset ?? 0;
     const entries = listing.files.slice(
       offset,

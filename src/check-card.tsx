@@ -4,6 +4,8 @@ import type {
   MonitorDefinition,
   WorkspaceState,
 } from "../shared/workspace";
+import type { UserFacingFailure } from "../shared/failure";
+import { FailureNotice } from "./components/failure-notice";
 import { StatusBadge, type StatusBadgeVariant } from "./components/status-badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent } from "./components/ui/card";
@@ -110,7 +112,7 @@ function MonitorRow({ check, workspace }: { check: MonitorDefinition; workspace:
   const presentation = run
     ? runPresentation(run.status)
     : { label: "Waiting for data", variant: "warning" as const };
-  const detail = run?.status === "failed" ? "This check did not complete." : run?.reason;
+  const detail = run?.reason;
   const updated =
     run && run.status !== "failed" ? new Date(run.completedAt).toLocaleString() : undefined;
 
@@ -121,9 +123,13 @@ function MonitorRow({ check, workspace }: { check: MonitorDefinition; workspace:
           <strong className="text-sm font-medium">{check.name}</strong>
           <StatusBadge variant={presentation.variant}>{presentation.label}</StatusBadge>
         </div>
-        <span className="text-xs leading-5 text-muted-foreground">
-          {detail ?? "Waiting for the first check."}
-        </span>
+        {run?.status === "failed" && run.failure ? (
+          <FailureNotice compact failure={run.failure} />
+        ) : (
+          <span className="text-xs leading-5 text-muted-foreground">
+            {detail ?? "Waiting for the first check."}
+          </span>
+        )}
         {updated ? (
           <span className="text-xs text-muted-foreground">
             Updated {updated} · {windowLabel(check.currentWindowMinutes)} vs{" "}
@@ -153,7 +159,7 @@ export function CheckCard({
   onRun,
 }: {
   workspace: WorkspaceState;
-  error?: string;
+  error?: UserFacingFailure;
   onRun: () => void;
 }) {
   const checking = workspace.status === "checking";
@@ -186,8 +192,14 @@ export function CheckCard({
           </ul>
         </CardContent>
       </Card>
-      {workspace.warning ? <p className="text-sm text-amber-400">{workspace.warning}</p> : null}
-      {error ? <p className="text-sm text-red-400">{error}</p> : null}
+      {workspace.warnings.map((warning) => (
+        <FailureNotice
+          failure={warning}
+          key={`${warning.code}:${warning.reference ?? warning.message}`}
+          warning
+        />
+      ))}
+      {error ? <FailureNotice failure={error} /> : null}
     </section>
   );
 }

@@ -12,6 +12,11 @@ interface CloudflareEnvelope<T> {
   result: T;
 }
 
+interface CloudflareGraphqlEnvelope {
+  data?: unknown;
+  errors?: Array<{ message?: string }>;
+}
+
 export interface CloudflareApiResult {
   path: string;
   data: unknown;
@@ -79,11 +84,20 @@ export async function queryCloudflareGraphql(
     throw new Error("Cloudflare investigations only support read-only GraphQL queries");
   }
 
-  return fetchProviderJson<unknown>("Cloudflare", "https://api.cloudflare.com/client/v4/graphql", {
-    method: "POST",
-    headers: { ...headers(config), "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
+  const response = await fetchProviderJson<CloudflareGraphqlEnvelope>(
+    "Cloudflare",
+    "https://api.cloudflare.com/client/v4/graphql",
+    {
+      method: "POST",
+      headers: { ...headers(config), "Content-Type": "application/json" },
+      body: JSON.stringify({ query, variables }),
+    },
+  );
+  if (response.errors?.length) {
+    const graphqlError = response.errors.find((error) => error.message)?.message ?? "unknown error";
+    throw new ProviderRequestError("Cloudflare", `Cloudflare GraphQL failed: ${graphqlError}`);
+  }
+  return response;
 }
 
 export async function getCloudflareContext(

@@ -5,6 +5,7 @@ import type { UIMessage } from "ai";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { createInitialWorkspaceState, type WorkspaceState } from "../shared/workspace";
+import { createFailure, type CommandResult, type UserFacingFailure } from "../shared/failure";
 import { workspaceConfig } from "../workspace.config";
 import { CheckCard } from "./check-card";
 import { Investigations, type PendingInvestigationAction } from "./investigations";
@@ -23,6 +24,16 @@ function relativeDuration(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   return remainder > 0 ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function clientFailure(message: string, action: string) {
+  return createFailure({
+    code: "unexpected",
+    message,
+    action,
+    retryable: true,
+    source: "client",
+  });
 }
 
 function MonitorStatus({ workspace }: { workspace: WorkspaceState }) {
@@ -59,8 +70,8 @@ function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() =>
     createInitialWorkspaceState(workspaceConfig.checks),
   );
-  const [checkError, setCheckError] = useState<string>();
-  const [investigationError, setInvestigationError] = useState<string>();
+  const [checkError, setCheckError] = useState<UserFacingFailure>();
+  const [investigationError, setInvestigationError] = useState<UserFacingFailure>();
   const [simulating, setSimulating] = useState(false);
   const [pendingInvestigationAction, setPendingInvestigationAction] =
     useState<PendingInvestigationAction>();
@@ -75,21 +86,29 @@ function App() {
   }, [workspaceAgent]);
   const loadInvestigationTranscript = useCallback(
     (threadId: string) =>
-      workspaceAgentRef.current.call<UIMessage[]>("getInvestigationTranscript", [threadId], {
-        timeout: 30_000,
-      }),
+      workspaceAgentRef.current.call<CommandResult<UIMessage[]>>(
+        "getInvestigationTranscript",
+        [threadId],
+        { timeout: 30_000 },
+      ),
     [],
   );
 
   async function runCheck() {
     setCheckError(undefined);
     try {
-      const nextState = await workspaceAgent.call<WorkspaceState>("reconcile", [], {
+      const result = await workspaceAgent.call<CommandResult<WorkspaceState>>("runChecks", [], {
         timeout: 60_000,
       });
-      setWorkspace(nextState);
+      if (result.ok) setWorkspace(result.value);
+      else setCheckError(result.failure);
     } catch {
-      setCheckError("The check could not run. Verify provider access and try again.");
+      setCheckError(
+        clientFailure(
+          "Tracer could not reach the monitoring service.",
+          "Check your connection and try again.",
+        ),
+      );
     }
   }
 
@@ -97,12 +116,20 @@ function App() {
     setInvestigationError(undefined);
     setSimulating(true);
     try {
-      const nextState = await workspaceAgent.call<WorkspaceState>("simulateInvestigation", [], {
-        timeout: 60_000,
-      });
-      setWorkspace(nextState);
+      const result = await workspaceAgent.call<CommandResult<WorkspaceState>>(
+        "simulateInvestigation",
+        [],
+        { timeout: 60_000 },
+      );
+      if (result.ok) setWorkspace(result.value);
+      else setInvestigationError(result.failure);
     } catch {
-      setInvestigationError("The drill could not start. Verify provider access and try again.");
+      setInvestigationError(
+        clientFailure(
+          "Tracer could not start the investigation drill.",
+          "Check your connection and try again.",
+        ),
+      );
     } finally {
       setSimulating(false);
     }
@@ -112,14 +139,20 @@ function App() {
     setInvestigationError(undefined);
     setPendingInvestigationAction({ kind: "retry", threadId });
     try {
-      const nextState = await workspaceAgent.call<WorkspaceState>(
+      const result = await workspaceAgent.call<CommandResult<WorkspaceState>>(
         "retryInvestigation",
         [threadId],
         { timeout: 60_000 },
       );
-      setWorkspace(nextState);
+      if (result.ok) setWorkspace(result.value);
+      else setInvestigationError(result.failure);
     } catch {
-      setInvestigationError("The investigation could not be retried. Run checks and try again.");
+      setInvestigationError(
+        clientFailure(
+          "Tracer could not reach the monitoring service.",
+          "Check your connection and try the investigation again.",
+        ),
+      );
     } finally {
       setPendingInvestigationAction(undefined);
     }
@@ -130,14 +163,20 @@ function App() {
     setInvestigationError(undefined);
     setPendingInvestigationAction({ kind: "delete", threadId });
     try {
-      const nextState = await workspaceAgent.call<WorkspaceState>(
+      const result = await workspaceAgent.call<CommandResult<WorkspaceState>>(
         "deleteInvestigation",
         [threadId],
         { timeout: 30_000 },
       );
-      setWorkspace(nextState);
+      if (result.ok) setWorkspace(result.value);
+      else setInvestigationError(result.failure);
     } catch {
-      setInvestigationError("The investigation could not be deleted. Try again.");
+      setInvestigationError(
+        clientFailure(
+          "Tracer could not reach the monitoring service.",
+          "Check your connection and try deleting the investigation again.",
+        ),
+      );
     } finally {
       setPendingInvestigationAction(undefined);
     }

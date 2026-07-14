@@ -1,14 +1,19 @@
 import { StatusBadge } from "../components/status-badge";
+import { FailureNotice } from "../components/failure-notice";
 import { Button } from "../components/ui/button";
 import { Card } from "../components/ui/card";
 import { Empty, EmptyDescription, EmptyHeader } from "../components/ui/empty";
 import { Spinner } from "../components/ui/spinner";
-import type { UIMessage } from "ai";
 import { ChevronRight, Ellipsis, RotateCcw, Trash2 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import type { InvestigationSummary } from "../../shared/workspace";
+import type { UserFacingFailure } from "../../shared/failure";
 import { InvestigationDetail, InvestigationDetailByThread } from "./detail";
-import { InvestigationTranscriptProvider, useInvestigationThread } from "./live";
+import {
+  InvestigationTranscriptProvider,
+  type TranscriptLoader,
+  useInvestigationThread,
+} from "./live";
 import {
   describeInvestigation,
   describeInvestigationTrigger,
@@ -145,12 +150,8 @@ function InvestigationActions({
   );
 }
 
-function InvestigationError({ error }: { error?: string }) {
-  return error ? (
-    <span className="block min-w-0 truncate text-xs text-red-400" title={error}>
-      {error}
-    </span>
-  ) : null;
+function InvestigationError({ failure }: { failure?: UserFacingFailure }) {
+  return failure ? <FailureNotice compact failure={failure} /> : null;
 }
 
 function StaticInvestigationItem({
@@ -180,7 +181,7 @@ function StaticInvestigationItem({
           expanded={expanded}
           meta={
             <>
-              <InvestigationError error={investigation.error} />
+              <InvestigationError failure={investigation.failure} />
               <span className="text-xs text-muted-foreground">
                 {formatOpenedAt(investigation.submittedAt)}
               </span>
@@ -236,7 +237,7 @@ function LiveInvestigationItem({
   if (concluded) {
     meta = (
       <>
-        <InvestigationError error={investigation.error} />
+        <InvestigationError failure={investigation.failure} />
         {activity ? <span className="text-xs text-muted-foreground">{activity}</span> : null}
         <span className="text-xs text-muted-foreground">
           {formatOpenedAt(investigation.submittedAt)}
@@ -354,9 +355,9 @@ export function Investigations({
   pendingAction,
   loadTranscript,
 }: {
-  error?: string;
+  error?: UserFacingFailure;
   investigations: InvestigationSummary[];
-  loadTranscript: (threadId: string) => Promise<UIMessage[]>;
+  loadTranscript: TranscriptLoader;
   onDelete: (threadId: string) => void;
   onRetry: (threadId: string) => void;
   onSimulate: () => void;
@@ -391,7 +392,7 @@ export function Investigations({
           </Button>
         </div>
 
-        {error ? <p className="text-sm text-red-400">{error}</p> : null}
+        {error ? <FailureNotice failure={error} /> : null}
 
         {investigations.length === 0 ? (
           <Empty className="min-h-40 border bg-card/40">

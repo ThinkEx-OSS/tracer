@@ -1,4 +1,5 @@
 import { StatusBadge } from "../components/status-badge";
+import { FailureNotice } from "../components/failure-notice";
 import { buttonVariants } from "../components/ui/button";
 import { Card, CardContent, CardHeader } from "../components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../components/ui/collapsible";
@@ -75,6 +76,7 @@ function InvestigationBody({ live }: { live: InvestigationView }) {
 
   return (
     <div className="grid gap-5 p-5">
+      {live.failure ? <FailureNotice failure={live.failure} /> : null}
       {report ? (
         <Card className="gap-2 bg-card/70 py-4 shadow-none">
           <CardHeader>
@@ -132,6 +134,5 @@ export function InvestigationDetail({ live }: { live: InvestigationView }) {
 
 export function InvestigationDetailByThread({ threadId }: { threadId: string }) {
   const live = useInvestigationSnapshot(threadId);
-  if (live.error) return <p className="p-5 text-sm text-red-400">{live.error}</p>;
   return <InvestigationBody live={live} />;
 }
